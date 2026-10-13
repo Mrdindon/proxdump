@@ -10,7 +10,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 TITLE="proxdump $VERSION"
 
 CONF_DIR="${PROXDUMP_CONF_DIR:-/etc/proxdump}"
@@ -828,8 +828,8 @@ need_ready() {
     return 1
 }
 
-# Makes one of the configured destinations the current one; the question is
-# skipped when there is only one.
+# Makes one of the configured destinations the current one; the question
+# (the argument, if any) is skipped when there is only one.
 pick_dest() {
     local items=() id label
     while IFS=$'\t' read -r id label; do
@@ -838,7 +838,7 @@ pick_dest() {
     case ${#items[@]} in
     0) need_ready; return 1 ;;
     2) id=${items[0]} ;;
-    *) id=$(menu "$(t "Select the destination:")" "${items[@]}") || return 1 ;;
+    *) id=$(menu "${1:-$(t "Select the destination:")}" "${items[@]}") || return 1 ;;
     esac
     use_dest "$id"
 }
@@ -1054,7 +1054,7 @@ pick_storage() { # guest type -> storage name
 }
 
 ui_restore() {
-    pick_dest || return
+    pick_dest "$(t "Select the source of the restore:")" || return
     load_backups || return
     ((${#BACKUPS[@]})) || { msg "$(t "No backup was found on {1}." "$DEST_NAME")"; return; }
     local items=() i sel id ts type name size path action target storage
