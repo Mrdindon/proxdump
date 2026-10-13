@@ -29,6 +29,9 @@ COMPRESS="zstd"                   # zstd | gzip | lzo | 0
 BWLIMIT=""                        # rclone rate limit (e.g. 10M), empty = none
 VERIFY=1                          # verify checksums after upload
 UI_LANG=""                        # interface language; empty = that of the system
+UI_STYLE="whiptail"               # whiptail | native (dialogs drawn by proxdump)
+UI_THEME="auto"                   # colours of the native interface
+UI_MOUSE=1                        # mouse in the native interface
 declare -A KEEP_BY_ID=()          # per-guest retention: KEEP_BY_ID[100]=5
 
 CLEANUP_DIRS=()
@@ -47,12 +50,19 @@ if [[ -z $LANG_DIR ]]; then
     LANG_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lang"
     [[ -d $LANG_DIR ]] || LANG_DIR=/usr/local/share/proxdump/lang
 fi
+LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib"
+[[ -d $LIB_DIR ]] || LIB_DIR=/usr/local/share/proxdump/lib
 CUR_LANG=en
 declare -A T=()
 _m() { T[$1]=$2; }
 
 # Accented, Cyrillic and Chinese characters need a UTF-8 terminal
-[[ $(locale charmap 2>/dev/null) == UTF-8 ]] || export LC_ALL=C.UTF-8
+UTF8_FORCED=0
+if [[ $(locale charmap 2>/dev/null) != UTF-8 ]]; then
+    export LC_ALL=C.UTF-8
+    # shellcheck disable=SC2034  # read by lib/tui.sh
+    UTF8_FORCED=1
+fi
 
 t() { # message, arguments
     local s=$1 i=1 a
@@ -142,6 +152,8 @@ cleanup() {
     for d in "${CLEANUP_DIRS[@]:-}"; do
         [[ -n $d && -d $d ]] && rm -rf -- "$d"
     done
+    declare -F tui_leave >/dev/null && tui_leave
+    return 0
 }
 trap cleanup EXIT
 trap 'ui_abort; echo; log "$(t "Interrupted.")"; exit 130' INT TERM
@@ -161,7 +173,8 @@ save_config() {
     {
         echo "# proxdump — generated automatically, contains no secrets"
         for v in REMOTE_DIR STAGING_DIR KEEP_DEFAULT \
-                 VZDUMP_MODE COMPRESS BWLIMIT VERIFY UI_LANG; do
+                 VZDUMP_MODE COMPRESS BWLIMIT VERIFY UI_LANG \
+                 UI_STYLE UI_THEME UI_MOUSE; do
             printf '%s=%q\n' "$v" "${!v}"
         done
         for id in "${!KEEP_BY_ID[@]}"; do
@@ -284,10 +297,7 @@ human_duration() { # seconds -> 1h02m, 3m04s, 5s
 # gauge fed through fd 8: a heading (G_HEAD), the current step (G_STEP) and
 # a line of details.
 gauge() { # percentage, details
-    local w=$((W - 4))
-    # Chinese characters are two columns wide
-    [[ $CUR_LANG == zh ]] && w=$((w / 2))
-    printf 'XXX\n%s\n%s\n\n%s\n%s\nXXX\n' "$1" "${G_HEAD:0:w}" "${G_STEP:0:w}" "${2:0:w}" 2>/dev/null >&8
+    printf 'XXX\n%s\n%s\n\n%s\n%s\nXXX\n' "$1" "$G_HEAD" "$G_STEP" "$2" 2>/dev/null >&8
 }
 gauge_step() {
     G_STEP=${1#=== }
@@ -604,7 +614,7 @@ backup_guests() { # vmid…
 
 dims() {
     local rows cols
-    read -r rows cols < <(stty size 2>/dev/null || echo "24 80")
+    read -r rows cols < <(stty size </dev/tty 2>/dev/null || echo "24 80")
     H=$((rows - 4)); ((H > 30)) && H=30; ((H < 16)) && H=16
     W=$((cols - 6)); ((W > 100)) && W=100; ((W < 60)) && W=60
     LH=$((H - 9))
@@ -678,13 +688,7 @@ ui_run() { # heading, command…
     G_HEAD=$heading
     G_STEP=""
     OP_DONE=""
-    # the gauge keeps the height of its first text: four lines
-    exec 8> >(exec whiptail --title "$TITLE" --gauge "$heading"$'\n \n \n ' 11 "$W" 0)
-    GAUGE_PID=$!
-    # whiptail switches the terminal to raw mode, in which Ctrl-C is an
-    # ordinary key: once it has started, interruptions are enabled again
-    sleep 0.3
-    stty isig intr '^C' 2>/dev/null
+    gauge_start "$heading"
     UI=1
     "$@" >"$out" 2>&1
     rc=$?
@@ -700,15 +704,88 @@ ui_run() { # heading, command…
         echo
         t "Duration: {1}. The details are recorded in the log." "$(human_duration $((SECONDS - start)))"
     } | sed '1{/^$/d}' | cat -s >"$out.txt"
-    text_lines "$(<"$out.txt")"
-    if ((TL + 6 <= H)); then
-        whiptail --title "$TITLE — $heading" "${BTN_OK[@]}" --msgbox "$(<"$out.txt")" $((TL + 6)) "$W"
-    else
-        fold -s -w $((W - 6)) "$out.txt" >"$out"
-        textbox "$TITLE — $heading" "$out"
-    fi
+    summary_show "$heading" "$out.txt"
     rm -f "$out" "$out.txt"
     return "$rc"
+}
+
+# Opens the gauge that follows an operation; it is fed through fd 8.
+# whiptail does not follow a change of the size of the terminal: a relay
+# stands between the operation and the gauge, and starts a new gauge with
+# the last text when the terminal is resized.
+gauge_start() { # heading
+    exec 8> >(_gauge_relay "$1" 2>/dev/null)
+    GAUGE_PID=$!
+}
+
+_gauge_relay() { # heading; the protocol of 'whiptail --gauge' on its input
+    local heading=$1 line state=0 resized=0 rc w wpid l
+    local -a block=() last=()
+    trap 'resized=1' WINCH
+    _start() {
+        dims
+        # the gauge keeps the height of its first text: four lines
+        exec 7> >(exec whiptail --title "$TITLE" --gauge "$heading"$'\n \n \n ' 11 "$W" 0)
+        wpid=$!
+        # whiptail switches the terminal to raw mode, in which Ctrl-C is an
+        # ordinary key: once it has started, interruptions are enabled again
+        sleep 0.3
+        stty isig intr '^C' </dev/tty 2>/dev/null
+    }
+    _send() {
+        w=$((W - 4))
+        # Chinese characters are two columns wide
+        [[ $CUR_LANG == zh ]] && w=$((w / 2))
+        {
+            printf 'XXX\n%s\n' "${last[0]:-0}"
+            for l in "${last[@]:1}"; do printf '%s\n' "${l:0:w}"; done
+            printf 'XXX\n'
+        } >&7
+    }
+    _start
+    while :; do
+        IFS= read -r -t 0.3 line
+        rc=$?
+        if ((resized)); then
+            resized=0
+            exec 7>&-
+            wait "$wpid" 2>/dev/null
+            _start
+            ((${#last[@]})) && _send
+        fi
+        if ((rc)); then
+            ((rc > 128)) && continue
+            break # end of the input: the operation is over
+        fi
+        if [[ $line == XXX ]]; then
+            if ((state)); then
+                last=("${block[@]}")
+                _send
+                state=0
+            else
+                block=()
+                state=1
+            fi
+        elif ((state)); then
+            block+=("$line")
+        fi
+    done
+    exec 7>&-
+    wait "$wpid" 2>/dev/null
+}
+
+summary_show() { # heading, file
+    local tmp
+    dims
+    text_lines "$(<"$2")"
+    if ((TL + 6 <= H)); then
+        whiptail --title "$TITLE — $1" "${BTN_OK[@]}" --msgbox "$(<"$2")" $((TL + 6)) "$W"
+    else
+        tmp=$(mktemp)
+        fold -s -w $((W - 6)) "$2" >"$tmp"
+        textbox "$TITLE — $1" "$tmp"
+        rm -f "$tmp"
+    fi
 }
 
 # Leaves the gauge cleanly when the operation is interrupted
@@ -1761,6 +1838,52 @@ ui_language() {
     fi
 }
 
+# i18n: "Classic (whiptail)" "Native (drawn by proxdump)" "Automatic"
+ui_interface() {
+    local choice v id items
+    local -A styles=([whiptail]="Classic (whiptail)" [native]="Native (drawn by proxdump)")
+    while :; do
+        v=$(t "Automatic")
+        [[ $UI_THEME != auto && -n ${THEME_NAMES[$UI_THEME]:-} ]] && v=$(t "${THEME_NAMES[$UI_THEME]}")
+        [[ -n ${THEME_NAMES[*]:-} ]] || v=$UI_THEME
+        choice=$(CANCEL=Back menu "$(t "Appearance of the interface")" \
+            S "$(t "Style: {1}" "$(t "${styles[$UI_STYLE]:-$UI_STYLE}")")" \
+            T "$(t "Colour theme (native style): {1}" "$v")" \
+            M "$(t "Mouse (native style): {1}" "$([[ $UI_MOUSE == 1 ]] && t "enabled" || t "disabled")")") || return
+        case $choice in
+        S)
+            v=$(menu "$(t "Select the style of the interface:")" \
+                whiptail "$(t "Classic (whiptail)")" \
+                native "$(t "Native (drawn by proxdump)")") || continue
+            [[ $v == "$UI_STYLE" ]] && continue
+            if [[ $v == native && ! -r $LIB_DIR/tui.sh ]]; then
+                msg "$(t "The native interface is not installed ({1} is missing); please run install.sh again." "$LIB_DIR/tui.sh")"
+                continue
+            fi
+            UI_STYLE=$v
+            save_config
+            msg "$(t "The new style will be used the next time proxdump is started.")"
+            ;;
+        T)
+            if ! declare -F theme_load >/dev/null; then
+                msg "$(t "The colour themes apply to the native style; select it first, then start proxdump again.")"
+                continue
+            fi
+            items=(auto "$(t "Automatic")")
+            for id in "${THEME_IDS[@]}"; do items+=("$id" "$(t "${THEME_NAMES[$id]}")"); done
+            v=$(menu "$(t "Select the colour theme:")" "${items[@]}") || continue
+            UI_THEME=$v
+            save_config
+            theme_load
+            ;;
+        M)
+            UI_MOUSE=$((1 - UI_MOUSE))
+            save_config
+            ;;
+        esac
+    done
+}
+
 ui_config() {
     local choice items i
     while :; do
@@ -1775,9 +1898,11 @@ ui_config() {
             D "$(t "Folder on the destinations: {1}" "$REMOTE_DIR")" \
             L "$(t "Local staging folder: {1}" "$STAGING_DIR")" \
             S "$(t "Backup options")" \
-            G "$(t "Language: {1}" "${LANG_NAMES[$CUR_LANG]}")") || return
+            G "$(t "Language: {1}" "${LANG_NAMES[$CUR_LANG]}")" \
+            I "$(t "Appearance of the interface")") || return
         case $choice in
         G) ui_language ;;
+        I) ui_interface ;;
         E) ui_setup_crypt ;;
         T) ui_test_all ;;
         D) ui_remote_dir ;;
@@ -2014,7 +2139,7 @@ main_menu() {
         6) ui_log ;;
         esac
     done
-    clear
+    if declare -F tui_leave >/dev/null; then tui_leave; else clear; fi
 }
 
 # --- Command line ------------------------------------------------------------
@@ -2064,6 +2189,12 @@ main() {
     case $cmd in
     "")
         [[ -t 0 && -t 1 ]] || die "$(t "the menus need a terminal; see --help.")"
+        # dialogs drawn by the tool itself instead of whiptail
+        if [[ ${PROXDUMP_UI:-$UI_STYLE} == native && -r $LIB_DIR/tui.sh ]]; then
+            # shellcheck disable=SC1091
+            source "$LIB_DIR/tui.sh"
+            tui_enter
+        fi
         main_menu
         ;;
     backup)

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Maintenance of the translations of proxdump.
 
-    tools/i18n.py list            numbered list of the messages found in proxdump
+    tools/i18n.py list            numbered list of the messages found in the sources
     tools/i18n.py check           missing and obsolete entries of each lang/<code>.sh
     tools/i18n.py build CODE FILE (re)generates lang/CODE.sh from a work file
 
 English is the source language. A message is any literal passed to the
-function t in proxdump:  t "Some text with {1}" "$arg"  — as well as the
+function t in proxdump or lib/tui.sh:  t "Some text with {1}" "$arg"  — as well as the
 block of  t "$(cat <<'EOT' … EOT)"  and the words listed in comments of the
 form  # i18n: "word" "other word"  (messages built at run time).
 
@@ -19,7 +19,7 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCRIPT = os.path.join(ROOT, 'proxdump')
+SOURCES = [os.path.join(ROOT, 'proxdump'), os.path.join(ROOT, 'lib', 'tui.sh')]
 LANG_DIR = os.path.join(ROOT, 'lang')
 
 
@@ -51,7 +51,7 @@ def read_dq(s, i):
 
 
 def messages():
-    src = open(SCRIPT, encoding='utf-8').read()
+    src = '\n'.join(open(f, encoding='utf-8').read() for f in SOURCES)
     found = []
 
     def add(pos, text):

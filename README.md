@@ -412,6 +412,27 @@ given in English whatever the language. Chinese and Russian need a terminal
 whose font has those characters, which rules out the physical console of the
 server.
 
+### Appearance
+
+**Configuration → Appearance of the interface** offers two styles:
+
+- **Classic**: the dialogs of `whiptail` (the default);
+- **Native**: dialogs drawn by proxdump itself, with a header bar, a window
+  with rounded borders, the available keys at the bottom of the screen, an
+  animated progress window, the mouse (click to open or tick, wheel to
+  scroll) and a choice of colour themes: Default, Dracula, Nord, Gruvbox,
+  Catppuccin, Tokyo Night, Solarized, Light and Basic (8 colours).
+
+The style applies from the next start. Both follow the size of the terminal
+when it changes, including during a backup. `PROXDUMP_UI=native` (or
+`whiptail`), `PROXDUMP_THEME=<name>` and `PROXDUMP_GLYPHS=ascii` override
+the settings for one run; ASCII characters are used by themselves on the
+Linux console. With the mouse enabled, hold Shift to select text with the
+terminal, or disable the mouse in the same menu.
+
+A theme is a file of `themes/` that lists the colours differing from the
+default theme defined in `lib/tui.sh`.
+
 ### 2. Encryption
 
 A single passphrase protects every destination.
@@ -609,6 +630,7 @@ succeeded). A lock prevents two operations from running at the same time:
 | `/etc/proxdump/sftp_known_hosts` | Host keys of the SFTP server | 600 |
 | `/etc/proxdump/config` | Settings (no secrets) | 600 |
 | `/usr/local/share/proxdump/lang/` | Translations of the interface | 644 |
+| `/usr/local/share/proxdump/lib/`, `themes/` | Native interface and its colour themes | 644 |
 | `/etc/cron.d/proxdump` | Schedules and daily token refreshes | 644 |
 | `/var/log/proxdump.log` | Operations log | — |
 

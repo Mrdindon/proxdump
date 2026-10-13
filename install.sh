@@ -57,6 +57,10 @@ install -m 755 "$SRC_DIR/proxdump" "$BIN"
 # translations of the interface (English is built in)
 install -d -m 755 "$SHARE_DIR/lang"
 install -m 644 "$SRC_DIR"/lang/*.sh "$SHARE_DIR/lang/"
+# native interface and its colour themes
+install -d -m 755 "$SHARE_DIR/lib" "$SHARE_DIR/themes"
+install -m 644 "$SRC_DIR"/lib/*.sh "$SHARE_DIR/lib/"
+install -m 644 "$SRC_DIR"/themes/*.sh "$SHARE_DIR/themes/"
 install -d -m 700 "$CONF_DIR"
 
 echo
