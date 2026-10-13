@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# onedrivepbs — encrypted backup of Proxmox VE VMs/containers to Microsoft OneDrive
+# onedrivepbs — encrypted backup of Proxmox VE VMs/containers to cloud storage
+# (Microsoft OneDrive, Google Drive)
 #
-# Pipeline: vzdump (temporary local archive) -> rclone crypt -> OneDrive
+# Pipeline: vzdump (temporary local archive) -> rclone crypt -> destination(s)
 # Interface: whiptail menus, or non-interactive subcommands (cron).
 #
 # MIT License — see LICENSE.
@@ -20,9 +21,7 @@ CRON_FILE="${ONEDRIVEPBS_CRON:-/etc/cron.d/onedrivepbs}"
 export RCLONE_CONFIG="$CONF_DIR/rclone.conf"
 
 # --- Defaults (overridden by $CONF_FILE) ------------------------------------
-BASE_REMOTE="onedrive"            # rclone remote pointing at OneDrive
-CRYPT_REMOTE="onedrive-crypt"     # rclone "crypt" remote layered on top
-REMOTE_DIR="pve-backups/$(hostname -s)"   # folder on OneDrive
+REMOTE_DIR="pve-backups/$(hostname -s)"   # folder on each destination
 STAGING_DIR="/var/lib/vz/dump"    # local staging folder (vzdump archives)
 KEEP_DEFAULT=3                    # versions kept per guest (0 = all)
 VZDUMP_MODE="snapshot"            # snapshot | suspend | stop
@@ -32,6 +31,25 @@ VERIFY=1                          # verify checksums after upload
 declare -A KEEP_BY_ID=()          # per-guest retention: KEEP_BY_ID[100]=5
 
 CLEANUP_DIRS=()
+
+# --- Destinations ------------------------------------------------------------
+# A destination is an rclone remote named after its id, with a "crypt" remote
+# '<id>-crypt' layered on top. Supporting another repository starts here.
+DEST_IDS=(onedrive gdrive)
+declare -A DEST_NAMES=([onedrive]="OneDrive" [gdrive]="Google Drive")
+declare -A DEST_TYPES=([onedrive]=onedrive [gdrive]=drive) # rclone backend
+declare -A DEST_VENDORS=([onedrive]=Microsoft [gdrive]=Google)
+DESTS=() # destinations of the backup being run
+
+# Makes a destination the current one: every function below that reads,
+# writes or deletes remote files works on it.
+use_dest() {
+    DEST=$1
+    BASE_REMOTE=$1
+    CRYPT_REMOTE="$1-crypt"
+    DEST_NAME=${DEST_NAMES[$1]:-$1}
+}
+use_dest onedrive
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -59,6 +77,8 @@ trap 'echo; log "Interrupted."; exit 130' INT TERM
 load_config() {
     # shellcheck disable=SC1090
     [[ -r $CONF_FILE ]] && source "$CONF_FILE"
+    # earlier versions saved the remote names; they now follow the destination
+    use_dest onedrive
     return 0
 }
 
@@ -67,7 +87,7 @@ save_config() {
     install -d -m 700 "$CONF_DIR"
     {
         echo "# onedrivepbs — generated automatically, contains no secrets"
-        for v in BASE_REMOTE CRYPT_REMOTE REMOTE_DIR STAGING_DIR KEEP_DEFAULT \
+        for v in REMOTE_DIR STAGING_DIR KEEP_DEFAULT \
                  VZDUMP_MODE COMPRESS BWLIMIT VERIFY; do
             printf '%s=%q\n' "$v" "${!v}"
         done
@@ -109,23 +129,48 @@ has_remote() {
     rclone listremotes 2>/dev/null | grep -qxF "$1:"
 }
 
-is_ready() {
+is_ready() { # the current destination
     has_remote "$BASE_REMOTE" && has_remote "$CRYPT_REMOTE"
 }
 
-# Backup destinations that are configured and usable. TSV: id, label
-# OneDrive is the only repository so far; another one is declared here, and
-# the scheduling menu and 'backup --to' then offer it.
+# Destinations that are connected and usable. TSV: id, label
 dest_list() {
-    is_ready && printf 'onedrive\tOneDrive (%s)\n' "$REMOTE_DIR"
+    local id remotes
+    remotes=$(rclone listremotes 2>/dev/null)
+    for id in "${DEST_IDS[@]}"; do
+        grep -qxF "$id:" <<<"$remotes" && grep -qxF "$id-crypt:" <<<"$remotes" &&
+            printf '%s\t%s\n' "$id" "${DEST_NAMES[$id]}"
+    done
 }
 
-dest_label() { # id -> label
-    local id label
-    while IFS=$'\t' read -r id label; do
-        [[ $id == "$1" ]] && { echo "$label"; return; }
-    done < <(dest_list)
-    echo "$1 (not configured)"
+dest_ready() { # id
+    dest_list | cut -f1 | grep -qxF -- "$1"
+}
+
+# 'onedrive,gdrive' -> 'OneDrive and Google Drive'; empty = whatever is configured
+dest_label() {
+    local id out=""
+    [[ -n $1 ]] || { echo "every configured destination"; return; }
+    for id in ${1//,/ }; do
+        out+="${out:+ and }${DEST_NAMES[$id]:-$id}"
+    done
+    echo "$out"
+}
+
+# Fills DESTS from a comma-separated list (empty = every configured
+# destination); fails with a message if one of them cannot be used.
+set_dests() {
+    local id
+    DESTS=()
+    if [[ -z $1 ]]; then
+        mapfile -t DESTS < <(dest_list | cut -f1)
+        ((${#DESTS[@]})) || { echo "no destination is configured"; return 1; }
+        return 0
+    fi
+    for id in ${1//,/ }; do
+        dest_ready "$id" || { echo "destination '$id' is unknown or not configured"; return 1; }
+        DESTS+=("$id")
+    done
 }
 
 human_size() {
@@ -278,7 +323,7 @@ guest_list() {
     done | sort -n
 }
 
-# Backups stored on OneDrive, newest first for each guest.
+# Backups stored on the current destination, newest first for each guest.
 # TSV: vmid, timestamp, type, name, size (bytes), path
 remote_list() {
     local json err
@@ -342,7 +387,7 @@ prune_remote() {
 # --- Backup ------------------------------------------------------------------
 
 backup_guest() { # vmid type name
-    local id=$1 type=$2 name=$3 tmp archive safe dest rc
+    local id=$1 type=$2 name=$3 tmp archive safe dest rc d
     safe=$(tr -c 'A-Za-z0-9.-' '-' <<<"$name" | sed 's/-*$//')
     dest="${id}_${safe:-guest}"
 
@@ -364,32 +409,39 @@ backup_guest() { # vmid type name
         return 1
     fi
 
-    log "Encrypted upload of $(basename "$archive") ($(human_size "$(stat -c %s "$archive")")) to OneDrive…"
-    if ! rclone_copy "$tmp" "$CRYPT_REMOTE:$dest"; then
-        log "ERROR: upload to OneDrive failed for $id"
-        rm -rf -- "$tmp"
-        return 1
-    fi
-
-    if [[ $VERIFY == 1 ]]; then
-        log "Verifying checksums (re-reads the local archive, no progress shown)…"
-        if ! rclone cryptcheck "$tmp" "$CRYPT_REMOTE:$dest" --one-way \
-            --log-file "$LOG_FILE" --log-level NOTICE; then
-            log "ERROR: verification failed for $id — the remote copy cannot be trusted"
-            rm -rf -- "$tmp"
-            return 1
+    # one archive, uploaded to each destination in turn
+    for d in "${DESTS[@]}"; do
+        use_dest "$d"
+        log "Encrypted upload of $(basename "$archive") ($(human_size "$(stat -c %s "$archive")")) to $DEST_NAME…"
+        if ! rclone_copy "$tmp" "$CRYPT_REMOTE:$dest"; then
+            log "ERROR: upload to $DEST_NAME failed for $id"
+            rc=1
+            continue
         fi
-    fi
-
+        if [[ $VERIFY == 1 ]]; then
+            log "Verifying checksums (re-reads the local archive, no progress shown)…"
+            if ! rclone cryptcheck "$tmp" "$CRYPT_REMOTE:$dest" --one-way \
+                --log-file "$LOG_FILE" --log-level NOTICE; then
+                log "ERROR: verification failed for $id — the copy on $DEST_NAME cannot be trusted"
+                rc=1
+                continue
+            fi
+        fi
+        log "Backup of $id to $DEST_NAME complete."
+        prune_remote "$id"
+    done
     rm -rf -- "$tmp"
-    log "Backup of $id complete."
-    prune_remote "$id"
+    return "$rc"
 }
 
-# Backs up a list of guests; exit status = number of failures
+# Backs up a list of guests to the destinations in DESTS;
+# exit status = number of failures
 backup_guests() { # vmid…
     local id type name status failed=0 found guests
-    is_ready || { log "ERROR: OneDrive or encryption is not configured"; return 1; }
+    ((${#DESTS[@]})) || { log "ERROR: no destination is configured"; return 1; }
+    for id in "${DESTS[@]}"; do
+        dest_ready "$id" || { log "ERROR: destination '$id' is not configured"; return 1; }
+    done
     acquire_lock || return 1
     guests=$(guest_list)
     for id in "$@"; do
@@ -491,16 +543,49 @@ pause() {
 
 need_ready() {
     is_ready && return 0
-    msg "The OneDrive connection and the encryption must be configured before this function can be used.\n\nPlease complete the 'Configuration' menu first."
+    msg "A destination and the encryption must be configured before this function can be used.\n\nPlease complete the 'Configuration' menu first."
     return 1
+}
+
+# Makes one of the configured destinations the current one; the question is
+# skipped when there is only one.
+pick_dest() {
+    local items=() id label
+    while IFS=$'\t' read -r id label; do
+        items+=("$id" "$label")
+    done < <(dest_list)
+    case ${#items[@]} in
+    0) need_ready; return 1 ;;
+    2) id=${items[0]} ;;
+    *) id=$(menu "Select the destination:" "${items[@]}") || return 1 ;;
+    esac
+    use_dest "$id"
+}
+
+# Same, for a backup: several destinations may be selected (into DESTS)
+pick_dests() {
+    local items=() id label sel
+    while IFS=$'\t' read -r id label; do
+        items+=("$id" "$label" ON)
+    done < <(dest_list)
+    DESTS=()
+    case ${#items[@]} in
+    0) need_ready; return 1 ;;
+    3) DESTS=("${items[0]}") ;;
+    *)
+        sel=$(checklist "Select the destinations of the backup (Space to select, Enter to confirm).\n\nThe archive is created once, then uploaded to each of them." "${items[@]}") || return 1
+        [[ -n $sel ]] || { msg "No destination was selected."; return 1; }
+        mapfile -t DESTS <<<"$sel"
+        ;;
+    esac
 }
 
 # Loads the remote listing into the BACKUPS array (one TSV line per entry)
 load_backups() {
     local out
-    busy "Reading the list of backups from OneDrive…"
+    busy "Reading the list of backups from $DEST_NAME…"
     if ! out=$(remote_list); then
-        msg "The list of backups could not be read from OneDrive.\n\nPlease verify the connection (Configuration > Test the OneDrive connection)."
+        msg "The list of backups could not be read from $DEST_NAME.\n\nPlease verify the connection (Configuration > Test the connections)."
         return 1
     fi
     BACKUPS=()
@@ -515,7 +600,7 @@ backup_label() { # TSV line -> readable label
 }
 
 ui_backup() {
-    need_ready || return
+    pick_dests || return
     local items=() id type name status sel free
     while IFS=$'\t' read -r id type name status; do
         [[ -n $id ]] && items+=("$id" "$(printf '%-4s %-22.22s %s' "$type" "$name" "$status")" OFF)
@@ -533,7 +618,7 @@ ui_backup() {
 ui_list() {
     need_ready || return
     load_backups || return
-    ((${#BACKUPS[@]})) || { msg "No backup was found on OneDrive."; return; }
+    ((${#BACKUPS[@]})) || { msg "No backup was found on $DEST_NAME."; return; }
     local tmp line total=0 size
     tmp=$(mktemp)
     {
@@ -547,22 +632,22 @@ ui_list() {
         echo
         echo "${#BACKUPS[@]} backup(s), $(human_size "$total") in total (size before encryption)"
     } >"$tmp"
-    textbox "$TITLE — backups on OneDrive" "$tmp"
+    textbox "$TITLE — backups on $DEST_NAME" "$tmp"
     rm -f "$tmp"
 }
 
 ui_delete() {
     need_ready || return
     load_backups || return
-    ((${#BACKUPS[@]})) || { msg "No backup was found on OneDrive."; return; }
+    ((${#BACKUPS[@]})) || { msg "No backup was found on $DEST_NAME."; return; }
     local items=() i sel n=0
     for i in "${!BACKUPS[@]}"; do
         items+=("$i" "$(backup_label "${BACKUPS[$i]}")" OFF)
     done
-    sel=$(checklist "Select the backups to delete from OneDrive (Space to select, Enter to confirm)." "${items[@]}") || return
+    sel=$(checklist "Select the backups to delete from $DEST_NAME (Space to select, Enter to confirm)." "${items[@]}") || return
     [[ -n $sel ]] || return
     n=$(wc -l <<<"$sel")
-    confirm_no "Delete $n backup(s) from OneDrive?\n\nDeleted files remain in the OneDrive recycle bin, still encrypted, until OneDrive purges them." || return
+    confirm_no "Delete $n backup(s) from $DEST_NAME?\n\nDeleted files remain in the recycle bin of the account, still encrypted, until it is emptied." || return
     screen "Deletion"
     acquire_lock || { pause; return; }
     for i in $sel; do
@@ -617,7 +702,7 @@ ui_retention() {
 
 ui_prune() {
     need_ready || return
-    confirm_no "Apply the retention policy now?\n\nFor each guest, the backups in excess of the configured number of versions will be deleted from OneDrive, oldest first." || return
+    confirm_no "Apply the retention policy now?\n\nFor each guest, the backups in excess of the configured number of versions will be deleted from $DEST_NAME, oldest first." || return
     screen "Retention"
     acquire_lock || { pause; return; }
     prune_remote
@@ -628,20 +713,21 @@ ui_prune() {
 ui_about() {
     need_ready || return
     local out
-    busy "Querying the OneDrive account…"
+    busy "Querying the $DEST_NAME account…"
     out=$(rclone about "$BASE_REMOTE:" 2>&1)
-    msg "Storage of the OneDrive account:\n\n$out"
+    msg "Storage of the $DEST_NAME account:\n\n$out"
 }
 
 ui_manage() {
     local choice
+    pick_dest || return
     while :; do
-        choice=$(CANCEL=Back menu "Management of the backups stored on OneDrive" \
+        choice=$(CANCEL=Back menu "Management of the backups stored on $DEST_NAME" \
             L "List the backups" \
             D "Delete backups" \
             V "Retention policy" \
             P "Apply the retention policy now" \
-            S "Storage used on OneDrive") || return
+            S "Storage used on $DEST_NAME") || return
         case $choice in
         L) ui_list ;;
         D) ui_delete ;;
@@ -670,9 +756,9 @@ pick_storage() { # guest type -> storage name
 }
 
 ui_restore() {
-    need_ready || return
+    pick_dest || return
     load_backups || return
-    ((${#BACKUPS[@]})) || { msg "No backup was found on OneDrive."; return; }
+    ((${#BACKUPS[@]})) || { msg "No backup was found on $DEST_NAME."; return; }
     local items=() i sel id ts type name size path action target storage tmp file rc
     local force=() unique=() free
     for i in "${!BACKUPS[@]}"; do
@@ -740,7 +826,7 @@ ui_restore() {
             log "ERROR: restore failed (exit code $rc)."
         fi
     else
-        log "ERROR: download from OneDrive failed."
+        log "ERROR: download from $DEST_NAME failed."
     fi
     rm -rf -- "$tmp"
     release_lock
@@ -799,14 +885,63 @@ pick_drive() { # rclone's JSON answer
         i=${real[0]}
     else
         ((${#real[@]} > 2)) && items=("${real[@]}")
-        i=$(menu "Select the OneDrive drive to use:" "${items[@]}") || return 1
+        i=$(menu "Select the drive to use:" "${items[@]}") || return 1
     fi
     jq -r ".Option.Examples[$i].Value" <<<"$out"
 }
 
-# Drives rclone's configuration wizard one question at a time
-onedrive_wizard() {
-    local out err bak state qname help def result n i items token
+# Google Drive is reached through an OAuth client that belongs to the user.
+# Explains how to create one and reads its two values, which stay on screen
+# next to the instructions (into GD_CLIENT_ID and GD_CLIENT_SECRET).
+gdrive_client() {
+    screen "Google Drive: OAuth client"
+    cat <<EOF
+Google Drive is accessed through an "OAuth client" that you create, free of
+charge, in the Google Cloud console. This is done once, in a web browser on
+any computer; the two values it produces are then entered below.
+
+1. Open https://console.cloud.google.com/ and sign in to a Google account.
+   Create a project: "Select a project" > "New project" (any name).
+2. Menu "APIs & Services" > "Library": search for "Google Drive API", open
+   it and click "Enable".
+3. Menu "APIs & Services" > "OAuth consent screen" > "Get started": enter an
+   application name (for instance rclone) and your e-mail address, choose
+   the audience "External", accept the terms and click "Create".
+4. "Data Access" > "Add or remove scopes": tick the scope ending in
+   /auth/drive, then "Update" and "Save".
+5. "Branding": fill in "Application home page" and "Application privacy
+   policy link" with addresses of a domain of yours (for instance
+   https://example.org and https://example.org/privacy), add that domain
+   under "Authorized domains", then "Save". Google may then report that
+   the branding could not be verified: ignore it, no verification is needed.
+6. "Audience" > "Publish app" > "Confirm". Once published, the application
+   needs no test users, and the authorization does not expire after 7 days.
+7. "Clients" > "Create client": application type "Desktop app", then
+   "Create". Google displays the client ID and the client secret.
+
+Press Enter on an empty line to cancel.
+
+EOF
+    while :; do
+        read -e -r -p "Client ID > " GD_CLIENT_ID || return 1
+        GD_CLIENT_ID=$(tr -d '[:space:]' <<<"$GD_CLIENT_ID")
+        [[ -n $GD_CLIENT_ID ]] || return 1
+        [[ $GD_CLIENT_ID == *.apps.googleusercontent.com ]] && break
+        echo "A client ID ends with '.apps.googleusercontent.com'. Please enter it again."
+    done
+    read -e -r -p "Client secret > " GD_CLIENT_SECRET || return 1
+    GD_CLIENT_SECRET=$(tr -d '[:space:]' <<<"$GD_CLIENT_SECRET")
+    [[ -n $GD_CLIENT_SECRET ]]
+}
+
+# Drives rclone's configuration wizard, one question at a time, for the
+# current destination
+remote_wizard() {
+    local out err bak state qname help def result n i items token args=()
+    if [[ $DEST == gdrive ]]; then
+        gdrive_client || return 1
+        args=(scope=drive client_id="$GD_CLIENT_ID" client_secret="$GD_CLIENT_SECRET")
+    fi
     err=$(mktemp)
     bak=$(mktemp)
     [[ -f $RCLONE_CONFIG ]] && cp -p "$RCLONE_CONFIG" "$bak"
@@ -817,7 +952,7 @@ onedrive_wizard() {
         return 1
     }
     rclone config delete "$BASE_REMOTE" 2>/dev/null
-    out=$(rclone config create "$BASE_REMOTE" onedrive config_is_local=false --non-interactive 2>"$err")
+    out=$(rclone config create "$BASE_REMOTE" "${DEST_TYPES[$DEST]}" config_is_local=false "${args[@]}" --non-interactive 2>"$err")
     while :; do
         state=$(jq -r '.State // ""' <<<"$out" 2>/dev/null)
         if [[ -z $out || $(jq -r '.Error // ""' <<<"$out" 2>/dev/null) != "" ]]; then
@@ -831,7 +966,7 @@ onedrive_wizard() {
         n=$(jq -r '.Option.Examples | length' <<<"$out")
 
         if [[ $qname == config_token ]]; then
-            screen "OneDrive authorization"
+            screen "$DEST_NAME authorization"
             cat <<EOF
 This server has no web browser: access is authorized once, from another
 computer, and the resulting token is pasted here.
@@ -840,11 +975,11 @@ computer, and the resulting token is pasted here.
    (https://rclone.org/downloads/), preferably the version used by this
    server: $(rclone version 2>/dev/null | head -n1).
 
-2. On that computer, open a terminal and run:
+2. On that computer, open a terminal and run, exactly as shown:
 
-       rclone authorize "onedrive"
+       $(grep -o 'rclone authorize .*' <<<"$help" | head -n1)
 
-3. The browser opens the Microsoft sign-in page. Sign in with the account
+3. The browser opens the ${DEST_VENDORS[$DEST]} sign-in page. Sign in with the account
    that will hold the backups, then accept the access requested by rclone.
    The browser confirms with "Success!".
 
@@ -877,15 +1012,20 @@ EOF
             result=$(pick_drive "$out") || { wizard_abort; return 1; }
         elif [[ $qname == config_drive_ok ]]; then
             # rclone's final confirmation: the drive found, its type and its URL
-            if confirm "Use the following OneDrive drive?\n\n$(sed '1d;/./,$!d' <<<"$help")"; then result=true; else result=false; fi
+            if confirm "Use the following drive?\n\n$(sed '1d;/./,$!d' <<<"$help")"; then result=true; else result=false; fi
+        elif [[ $(jq -r '.Option.Type' <<<"$out") == bool ]]; then
+            # the default answer is rclone's own
+            if [[ $def == true ]]; then
+                if confirm "$help"; then result=true; else result=false; fi
+            else
+                if confirm_no "$help"; then result=true; else result=false; fi
+            fi
         elif ((n > 0)); then
             items=()
             for ((i = 0; i < n; i++)); do
                 items+=("$(jq -r ".Option.Examples[$i].Value" <<<"$out")" "$(jq -r ".Option.Examples[$i].Help" <<<"$out" | head -n1 | cut -c1-70)")
             done
             result=$(menu "$help" "${items[@]}") || { wizard_abort; return 1; }
-        elif [[ $(jq -r '.Option.Type' <<<"$out") == bool ]]; then
-            if confirm "$help"; then result=true; else result=false; fi
         else
             result=$(input "$help" "$def") || { wizard_abort; return 1; }
         fi
@@ -897,56 +1037,61 @@ EOF
 }
 
 # Deletes the token stored on this server. The authorization itself can only
-# be withdrawn on Microsoft's side: the user is told where.
-ui_remove_onedrive() {
-    local n note=""
+# be withdrawn on the provider's side: the user is told where.
+ui_remove_remote() {
+    local n note="" where
     load_schedules
     n=${#SCHEDULES[@]}
-    ((n)) && note="\n\n$n schedule(s) are defined: they will fail until a connection is configured again."
-    confirm_no "Remove the OneDrive connection from this server?\n\nThe access token stored in $RCLONE_CONFIG will be deleted. The backups on OneDrive and the encryption passphrase are kept.$note\n\nDo you wish to continue?" || return
+    ((n)) && note="\n\n$n schedule(s) are defined: those that use $DEST_NAME will fail until a connection is configured again."
+    confirm_no "Remove the $DEST_NAME connection from this server?\n\nThe access token stored in $RCLONE_CONFIG will be deleted. The backups on $DEST_NAME and the encryption passphrase are kept.$note\n\nDo you wish to continue?" || return
     rclone config delete "$BASE_REMOTE" 2>>"$LOG_FILE"
     if has_remote "$BASE_REMOTE"; then
-        msg "The OneDrive connection could not be removed. Please consult the log."
+        msg "The $DEST_NAME connection could not be removed. Please consult the log."
         return
     fi
-    log "OneDrive connection removed from this server." >/dev/null
-    msg "The OneDrive connection has been removed from this server.\n\nThe authorization granted to rclone remains registered with Microsoft. To withdraw it as well, sign in to the account and remove 'rclone' from the list of authorized applications:\n\n  Personal account:\n    https://account.microsoft.com/privacy/app-access\n\n  Work or school account:\n    https://myapps.microsoft.com"
+    log "$DEST_NAME connection removed from this server." >/dev/null
+    case $DEST in
+    onedrive) where="  Personal account:\n    https://account.microsoft.com/privacy/app-access\n\n  Work or school account:\n    https://myapps.microsoft.com" ;;
+    gdrive) where="  https://myaccount.google.com/connections" ;;
+    esac
+    msg "The $DEST_NAME connection has been removed from this server.\n\nThe authorization granted to rclone remains registered with ${DEST_VENDORS[$DEST]}. To withdraw it as well, sign in to the account and remove the application from the list of authorized applications:\n\n$where"
 }
 
-ui_setup_onedrive() {
+ui_setup_remote() { # for the current destination
     local choice
     if has_remote "$BASE_REMOTE"; then
-        choice=$(CANCEL=Back menu "A OneDrive connection ('$BASE_REMOTE') is configured.\n\nReplacing or removing it does not affect the backups already uploaded." \
+        choice=$(CANCEL=Back menu "A $DEST_NAME connection is configured.\n\nReplacing or removing it does not affect the backups already uploaded." \
             R "Replace the connection (sign in again, or use another account)" \
             D "Remove the connection from this server") || return
-        [[ $choice == D ]] && { ui_remove_onedrive; return; }
+        [[ $choice == D ]] && { ui_remove_remote; return; }
     fi
-    choice=$(menu "Select the method used to connect to OneDrive:" \
+    choice=$(menu "Select the method used to connect to $DEST_NAME:" \
         G "Guided configuration (recommended)" \
-        M "Manual rclone configuration (special cases such as SharePoint)") || return
+        M "Manual rclone configuration (special cases)") || return
     install -d -m 700 "$CONF_DIR"
     case $choice in
     G)
-        onedrive_wizard || { msg "The OneDrive connection was not completed. The previous configuration, if any, is unchanged."; return; }
+        remote_wizard || { msg "The $DEST_NAME connection was not completed. The previous configuration, if any, is unchanged."; return; }
         ;;
     M)
-        msg "The 'rclone config' tool will now open.\n\nCreate (n) a remote named exactly:\n\n    $BASE_REMOTE\n\nof type 'onedrive', then quit (q)."
+        msg "The 'rclone config' tool will now open.\n\nCreate (n) a remote named exactly:\n\n    $BASE_REMOTE\n\nof type '${DEST_TYPES[$DEST]}', then quit (q)."
         screen "Manual rclone configuration"
         rclone config
         chmod 600 "$RCLONE_CONFIG" 2>/dev/null
         ;;
     esac
+    ensure_crypt
     ui_test
 }
 
 ui_test() {
     local out
-    has_remote "$BASE_REMOTE" || { msg "The OneDrive connection is not configured."; return 1; }
-    busy "Testing the OneDrive connection…"
+    has_remote "$BASE_REMOTE" || { msg "The $DEST_NAME connection is not configured."; return 1; }
+    busy "Testing the $DEST_NAME connection…"
     if out=$(rclone about "$BASE_REMOTE:" 2>&1); then
-        msg "The OneDrive connection is operational.\n\n$out"
+        msg "The $DEST_NAME connection is operational.\n\n$out"
     else
-        msg "The OneDrive connection failed:\n\n$(tail -n 8 <<<"$out")"
+        msg "The $DEST_NAME connection failed:\n\n$(tail -n 8 <<<"$out")"
         return 1
     fi
 }
@@ -961,8 +1106,12 @@ names_plain() {
         '.[$n] | .filename_encryption == "off" and .suffix == ".encrypted"' >/dev/null
 }
 
+# The passphrase is shared by every destination: the first crypt remote
+# found provides it.
 obscured_passphrase() {
-    rclone config dump 2>/dev/null | jq -r --arg n "$CRYPT_REMOTE" '.[$n].password // empty'
+    rclone config dump 2>/dev/null | jq -r --args '
+        [ $ARGS.positional[] as $id | .[$id + "-crypt"].password // empty ] | first // empty' \
+        "${DEST_IDS[@]}"
 }
 
 current_passphrase() {
@@ -973,13 +1122,33 @@ current_passphrase() {
 
 # Writes the crypt section straight into rclone.conf, so the passphrase never
 # appears on a command line visible in 'ps'.
-write_crypt_section() { # obscured passphrase
+write_crypt_section() { # obscured passphrase, destinations (default: all)
+    local obscured=$1 id
+    shift
+    (($#)) || set -- "${DEST_IDS[@]}"
     install -d -m 700 "$CONF_DIR"
-    rclone config delete "$CRYPT_REMOTE" 2>/dev/null
     touch "$RCLONE_CONFIG"
     chmod 600 "$RCLONE_CONFIG"
-    printf '\n[%s]\ntype = crypt\nremote = %s:%s\npassword = %s\n%s\n' \
-        "$CRYPT_REMOTE" "$BASE_REMOTE" "$REMOTE_DIR" "$1" "$CRYPT_NAMES" >>"$RCLONE_CONFIG"
+    for id; do
+        rclone config delete "$id-crypt" 2>/dev/null
+        printf '\n[%s]\ntype = crypt\nremote = %s:%s\npassword = %s\n%s\n' \
+            "$id-crypt" "$id" "$REMOTE_DIR" "$obscured" "$CRYPT_NAMES" >>"$RCLONE_CONFIG"
+    done
+}
+
+# Gives every destination its crypt remote once a passphrase exists (a
+# destination added by a newer version, or connected after the encryption
+# was configured).
+ensure_crypt() {
+    local obscured id remotes missing=()
+    remotes=$(rclone listremotes 2>/dev/null)
+    for id in "${DEST_IDS[@]}"; do
+        grep -qxF "$id-crypt:" <<<"$remotes" || missing+=("$id")
+    done
+    ((${#missing[@]})) || return 0
+    obscured=$(obscured_passphrase)
+    [[ -n $obscured ]] || return 0
+    write_crypt_section "$obscured" "${missing[@]}"
 }
 
 write_crypt_remote() { # passphrase
@@ -990,7 +1159,7 @@ write_crypt_remote() { # passphrase
 
 # Earlier versions could encrypt or scramble the names. This converts such an
 # installation: the contents are encrypted the same way whatever the naming,
-# so the backups already on OneDrive are only renamed there (nothing is
+# so the backups already uploaded are only renamed there (nothing is
 # uploaded again).
 migrate_names() {
     local obscured json err base="$BASE_REMOTE:$REMOTE_DIR" path old enc n=0 failed=0
@@ -1003,12 +1172,12 @@ migrate_names() {
         else
             cat "$err" >>"$LOG_FILE"
             rm -f "$err"
-            log "ERROR: OneDrive could not be read; the file names were left unchanged"
+            log "ERROR: $DEST_NAME could not be read; the file names were left unchanged"
             return 1
         fi
     fi
     rm -f "$err"
-    write_crypt_section "$obscured" || return 1
+    write_crypt_section "$obscured" "$DEST" || return 1
     while IFS=$'\t' read -r path old; do
         [[ -n $path ]] || continue
         enc=$(rclone cryptdecode --reverse "$CRYPT_REMOTE:" "$path" 2>>"$LOG_FILE" </dev/null |
@@ -1029,7 +1198,7 @@ migrate_names() {
 }
 
 ui_migrate_names() {
-    confirm "The backups on OneDrive are stored under encrypted file names, as produced by an earlier version.\n\nThis version stores them under their original names followed by '.encrypted'. The existing backups can be renamed accordingly; their contents remain encrypted and nothing is uploaded again.\n\nDo you wish to convert them now?" || return
+    confirm "The backups on $DEST_NAME are stored under encrypted file names, as produced by an earlier version.\n\nThis version stores them under their original names followed by '.encrypted'. The existing backups can be renamed accordingly; their contents remain encrypted and nothing is uploaded again.\n\nDo you wish to convert them now?" || return
     screen "Conversion of the file names"
     acquire_lock || { pause; return; }
     migrate_names
@@ -1039,8 +1208,8 @@ ui_migrate_names() {
 
 ui_setup_crypt() {
     local choice p1 p2
-    if has_remote "$CRYPT_REMOTE"; then
-        choice=$(CANCEL=Back menu "Encryption is configured.\n\nThe contents of every file are encrypted (XSalsa20-Poly1305, 256-bit key). File names remain legible and carry the '.encrypted' suffix." \
+    if [[ -n $(obscured_passphrase) ]]; then
+        choice=$(CANCEL=Back menu "Encryption is configured. The same passphrase is used for every destination.\n\nThe contents of every file are encrypted (XSalsa20-Poly1305, 256-bit key). File names remain legible and carry the '.encrypted' suffix." \
             S "Display the passphrase (to record it in a safe place)" \
             C "Change the passphrase") || return
         case $choice in
@@ -1049,11 +1218,11 @@ ui_setup_crypt() {
             return
             ;;
         C)
-            confirm_no "Warning: the backups already on OneDrive were encrypted with the current passphrase. Once it is changed, this tool will no longer be able to read them unless the former passphrase is restored.\n\nDo you wish to continue?" || return
+            confirm_no "Warning: the backups already uploaded were encrypted with the current passphrase. Once it is changed, this tool will no longer be able to read them unless the former passphrase is restored.\n\nDo you wish to continue?" || return
             ;;
         esac
     fi
-    choice=$(menu "Encryption passphrase\n\nThe passphrase protects the files uploaded to OneDrive. Restoring from another server requires exactly the same passphrase." \
+    choice=$(menu "Encryption passphrase\n\nThe passphrase protects the files uploaded to every destination. Restoring from another server requires exactly the same passphrase." \
         G "Generate a strong random passphrase (recommended)" \
         E "Enter a passphrase (a new one, or that of an existing installation)") || return
     case $choice in
@@ -1073,15 +1242,17 @@ ui_setup_crypt() {
 }
 
 ui_remote_dir() {
-    local v
-    v=$(input "Destination folder on OneDrive (created if necessary).\n\nPlease note that existing backups are not moved." "$REMOTE_DIR") || return
+    local v id
+    v=$(input "Folder used on each destination (created if necessary).\n\nPlease note that existing backups are not moved." "$REMOTE_DIR") || return
     v=${v#/}
     v=${v%/}
     [[ -n $v ]] || { msg "The folder name may not be empty."; return; }
     REMOTE_DIR=$v
     save_config
-    has_remote "$CRYPT_REMOTE" &&
-        rclone config update "$CRYPT_REMOTE" remote="$BASE_REMOTE:$REMOTE_DIR" --no-obscure >/dev/null 2>>"$LOG_FILE"
+    for id in "${DEST_IDS[@]}"; do
+        has_remote "$id-crypt" &&
+            rclone config update "$id-crypt" remote="$id:$REMOTE_DIR" --no-obscure >/dev/null 2>>"$LOG_FILE"
+    done
 }
 
 ui_staging() {
@@ -1135,23 +1306,41 @@ ui_options() {
     done
 }
 
+ui_test_all() {
+    local id found=0
+    for id in "${DEST_IDS[@]}"; do
+        has_remote "$id" || continue
+        found=1
+        use_dest "$id"
+        ui_test
+    done
+    ((found)) || msg "No connection is configured."
+}
+
 ui_config() {
-    local choice
+    local choice items i
     while :; do
+        items=()
+        for i in "${!DEST_IDS[@]}"; do
+            items+=("$((i + 1))" "${DEST_NAMES[${DEST_IDS[$i]}]} connection: $(has_remote "${DEST_IDS[$i]}" && echo configured || echo "not configured")")
+        done
         choice=$(CANCEL=Back menu "Configuration (stored in $CONF_DIR, readable by root only)" \
-            O "OneDrive connection: $(has_remote "$BASE_REMOTE" && echo configured || echo "not configured")" \
-            E "Encryption: $(has_remote "$CRYPT_REMOTE" && echo configured || echo "not configured")" \
-            T "Test the OneDrive connection" \
-            D "OneDrive folder: $REMOTE_DIR" \
+            "${items[@]}" \
+            E "Encryption: $([[ -n $(obscured_passphrase) ]] && echo configured || echo "not configured")" \
+            T "Test the connections" \
+            D "Folder on the destinations: $REMOTE_DIR" \
             L "Local staging folder: $STAGING_DIR" \
             S "Backup options") || return
         case $choice in
-        O) ui_setup_onedrive ;;
         E) ui_setup_crypt ;;
-        T) ui_test ;;
+        T) ui_test_all ;;
         D) ui_remote_dir ;;
         L) ui_staging ;;
         S) ui_options ;;
+        *)
+            use_dest "${DEST_IDS[choice - 1]}"
+            ui_setup_remote
+            ;;
         esac
     done
 }
@@ -1186,7 +1375,7 @@ save_schedules() {
 schedule_parse() {
     read -r S_MIN S_HOUR _ _ S_DOW _ _ _ S_TARGETS <<<"$1"
     S_TARGETS=${S_TARGETS% >/dev/null 2>&1}
-    S_DEST=onedrive
+    S_DEST="" # no --to: every configured destination
     if [[ $S_TARGETS == "--to "* ]]; then
         S_TARGETS=${S_TARGETS#--to }
         S_DEST=${S_TARGETS%% *}
@@ -1204,10 +1393,10 @@ schedule_label() { # cron line -> readable label
 
 # Runs a schedule at once, exactly as cron would, with the progress on screen
 ui_schedule_run() { # cron line
-    local ids
+    local ids err
     schedule_parse "$1"
-    dest_list | cut -f1 | grep -qxF -- "$S_DEST" ||
-        { msg "The destination of this schedule ('$S_DEST') is not configured."; return; }
+    err=$(set_dests "$S_DEST") || { msg "This schedule cannot be run: $err."; return; }
+    set_dests "$S_DEST"
     ids=$S_TARGETS
     if [[ $ids == --all ]]; then
         ids=$(guest_list | cut -f1 | tr '\n' ' ')
@@ -1221,15 +1410,9 @@ ui_schedule_run() { # cron line
 }
 
 ui_schedule_add() {
-    local items=() id label dest choice dow="*" time hour min type name status sel targets self line
-    while IFS=$'\t' read -r id label; do
-        items+=("$id" "$label")
-    done < <(dest_list)
-    case ${#items[@]} in
-    0) msg "No backup destination is configured.\n\nPlease complete the 'Configuration' menu first."; return ;;
-    2) dest=${items[0]} ;;
-    *) dest=$(menu "Select the destination of the backups:" "${items[@]}") || return ;;
-    esac
+    local items=() id dest choice dow="*" time hour min type name status sel targets self line
+    pick_dests || return
+    dest=$(IFS=,; echo "${DESTS[*]}")
 
     choice=$(menu "Frequency of the backup" \
         D "Daily" \
@@ -1311,16 +1494,20 @@ ui_log() {
 
 main_menu() {
     local choice
-    if ! is_ready; then
-        msg "onedrivepbs has not been configured yet.\n\nBefore the first backup, please open the 'Configuration' menu in order to:\n\n  1. connect the OneDrive account;\n  2. define the encryption passphrase;\n  3. select the local staging folder for vzdump."
-    elif ! names_plain; then
-        ui_migrate_names
+    local id
+    ensure_crypt
+    if [[ -z $(dest_list) ]]; then
+        msg "onedrivepbs has not been configured yet.\n\nBefore the first backup, please open the 'Configuration' menu in order to:\n\n  1. connect at least one destination (OneDrive, Google Drive);\n  2. define the encryption passphrase;\n  3. select the local staging folder for vzdump."
     fi
+    for id in $(dest_list | cut -f1); do
+        use_dest "$id"
+        names_plain || ui_migrate_names
+    done
     while :; do
-        choice=$(CANCEL=Quit menu "Encrypted backup of Proxmox VE to OneDrive (node: $(hostname -s))" \
+        choice=$(CANCEL=Quit menu "Encrypted backup of Proxmox VE to cloud storage (node: $(hostname -s))" \
             1 "Back up virtual machines and containers" \
             2 "Restore a backup" \
-            3 "Manage the backups on OneDrive" \
+            3 "Manage the stored backups" \
             4 "Automatic scheduling" \
             5 "Configuration" \
             6 "Log") || break
@@ -1340,17 +1527,18 @@ main_menu() {
 
 usage() {
     cat <<EOF
-onedrivepbs $VERSION — encrypted Proxmox VE backup to OneDrive
+onedrivepbs $VERSION — encrypted Proxmox VE backup to OneDrive and Google Drive
 
 Usage:
-  onedrivepbs                     open the menus
-  onedrivepbs backup [--to DEST] --all | ID…
-                                  back up every guest on the node, or the
-                                  given ones; DEST is a configured destination
-                                  ('onedrive', the default and only one so far)
-  onedrivepbs list                list the backups stored on OneDrive
-  onedrivepbs prune               apply retention
+  onedrivepbs                               open the menus
+  onedrivepbs backup [--to DEST] --all      back up every guest on the node
+  onedrivepbs backup [--to DEST] ID [ID…]   back up the given guests
+  onedrivepbs list [--to DEST]              list the stored backups
+  onedrivepbs prune [--to DEST]             apply retention
   onedrivepbs --version | --help
+
+DEST is one or more destinations separated by commas: ${DEST_IDS[*]}.
+Without --to, every configured destination is used.
 
 Restore and configuration are done through the menus.
 EOF
@@ -1365,20 +1553,25 @@ main() {
     check_deps
     load_config
 
-    local ids line
-    case ${1:-} in
+    local ids line cmd=${1:-} err d
+    if [[ -n $cmd ]]; then
+        shift
+        if [[ ${1:-} == --to ]]; then
+            [[ -n ${2:-} ]] || die "--to requires a destination."
+            err=$(set_dests "$2") || die "$err."
+            set_dests "$2"
+            shift 2
+        else
+            err=$(set_dests "") || die "$err."
+            set_dests ""
+        fi
+    fi
+    case $cmd in
     "")
         [[ -t 0 && -t 1 ]] || die "the menus need a terminal; see --help."
         main_menu
         ;;
     backup)
-        shift
-        if [[ ${1:-} == --to ]]; then
-            [[ -n ${2:-} ]] || die "--to requires a destination."
-            dest_list | cut -f1 | grep -qxF -- "$2" ||
-                die "destination '$2' is unknown or not configured."
-            shift 2
-        fi
         (($#)) || die "specify --all or at least one ID."
         # a run started while another one is in progress waits for its turn
         LOCK_WAIT=43200
@@ -1392,16 +1585,21 @@ main() {
         backup_guests $ids
         ;;
     list)
-        is_ready || die "OneDrive or encryption is not configured."
-        while IFS= read -r line; do
-            backup_label "$line"
-            echo
-        done < <(remote_list)
+        for d in "${DESTS[@]}"; do
+            use_dest "$d"
+            ((${#DESTS[@]} > 1)) && echo "$DEST_NAME:"
+            while IFS= read -r line; do
+                backup_label "$line"
+                echo
+            done < <(remote_list)
+        done
         ;;
     prune)
-        is_ready || die "OneDrive or encryption is not configured."
         acquire_lock || exit 1
-        prune_remote
+        for d in "${DESTS[@]}"; do
+            use_dest "$d"
+            prune_remote
+        done
         ;;
     *)
         usage >&2

@@ -1,14 +1,16 @@
 # onedrivepbs
 
 **Encrypted** backup of the virtual machines and containers of a
-**Proxmox VE** node to **Microsoft OneDrive**, driven by `whiptail` menus.
+**Proxmox VE** node to **Microsoft OneDrive** and/or **Google Drive**,
+driven by `whiptail` menus.
 
 - backs up VMs (QEMU) and containers (LXC) with `vzdump`;
 - encrypts the contents on the server *before* upload; file names stay
   legible and carry an `.encrypted` suffix;
-- readable progress bars for `vzdump` and for the OneDrive transfers;
-- OneDrive credentials and passphrase are stored locally for subsequent runs;
-- manages the backups already on OneDrive: list, delete, number of versions
+- one archive can be uploaded to several destinations in the same run;
+- readable progress bars for `vzdump` and for the transfers;
+- credentials and passphrase are stored locally for subsequent runs;
+- manages the backups already uploaded: list, delete, number of versions
   kept (global or per guest);
 - restores under the original ID, under a new ID, or simply downloads;
 - cron scheduling and non-interactive subcommands.
@@ -47,7 +49,7 @@
 ## How it works
 
 ```
- guest (VM/CT)                 local staging folder                OneDrive
+ guest (VM/CT)                 local staging folder         OneDrive / Google Drive
 ┌─────────────┐   vzdump     ┌─────────────────────────┐  rclone  ┌──────────────────────┐
 │ 100 web     │ ───────────▶ │ vzdump-qemu-100-….vma.zst│ ──────▶ │ pve-backups/<node>/  │
 └─────────────┘              │ (plaintext, deleted after)│  crypt │  ….vma.zst.encrypted │
@@ -59,11 +61,12 @@ For each selected guest:
 1. `vzdump` creates the archive (and its log) in a temporary subfolder;
 2. `rclone` uploads it through a `crypt` *remote*: the file is encrypted
    locally (XSalsa20-Poly1305, key derived from the passphrase with scrypt),
-   so OneDrive only receives unreadable data;
+   so the destination only receives unreadable data;
 3. `rclone cryptcheck` compares the local and remote checksums;
-4. the temporary subfolder is deleted;
-5. retention is applied to that guest (the oldest versions beyond the
-   configured number are deleted).
+4. retention is applied to that guest (the oldest versions beyond the
+   configured number are deleted);
+5. steps 2 to 4 are repeated for each destination selected, then the
+   temporary subfolder is deleted.
 
 OneDrive shows this:
 
@@ -90,7 +93,8 @@ interface, without this tool.
 ## Requirements
 
 - a Proxmox VE node (developed and tested on PVE 9 / Debian 13), root access;
-- a Microsoft OneDrive account (personal or business) with enough space;
+- a Microsoft OneDrive account (personal or business) and/or a Google
+  account, with enough space;
 - a local folder that can temporarily hold the largest archive;
 - for the first connection: a computer with a web browser and
   [rclone](https://rclone.org/downloads/) (Windows, macOS or Linux).
@@ -112,7 +116,9 @@ To remove: `./install.sh --uninstall` (the configuration is kept).
 
 ## Initial configuration
 
-Run `onedrivepbs` as root and open **Configuration**. Three steps.
+Run `onedrivepbs` as root and open **Configuration**. Three steps: connect
+at least one destination (OneDrive, Google Drive, or both), define the
+encryption passphrase, and review the folders and options.
 
 ### 1. OneDrive connection
 
@@ -212,7 +218,7 @@ The tool then relays rclone's questions:
 
 The tool ends with a test that displays the total and free space of the
 account. It can be run again at any time with **Configuration → Test the
-OneDrive connection**.
+connections**.
 
 The token is saved in `/etc/onedrivepbs/rclone.conf`, readable by root only,
 and rclone renews it automatically. The authorization only has to be redone
@@ -241,7 +247,81 @@ it as well, remove `rclone` from the applications authorized on the account:
 Withdrawing it there invalidates every rclone token of that account,
 including the one used by another server.
 
+### 1b. Google Drive connection
+
+**Configuration → Google Drive connection → Guided configuration** follows
+the same principle as OneDrive: the authorization is granted in a browser on
+another computer and the token is pasted on the server. One preliminary step
+is specific to Google: creating an OAuth client.
+
+#### Create your OAuth client (once)
+
+Google Drive is accessed through an OAuth client that you create in your own
+Google Cloud project. It is free and only identifies "your copy of rclone"
+to Google.
+
+The guided configuration displays these steps on screen and waits for the
+two values they produce.
+
+1. Open <https://console.cloud.google.com/> and sign in to a Google account
+   (it does not have to be the one that holds the Drive). Create a project:
+   **Select a project → New project**, any name.
+2. **APIs & Services → Library**: search for **Google Drive API**, open it
+   and click **Enable**.
+3. **APIs & Services → OAuth consent screen → Get started**: enter an
+   application name (for instance `rclone`) and your e-mail address, choose
+   the audience **External**, accept the terms and click **Create**.
+4. **Data Access → Add or remove scopes**: tick the scope ending in
+   `/auth/drive`, then **Update** and **Save**.
+5. **Branding**: Google only lets you publish once this page is complete.
+   Fill in **Application home page** and **Application privacy policy
+   link** with addresses of a domain of yours (for instance
+   `https://example.org` and `https://example.org/privacy`), add that
+   domain under **Authorized domains**, then **Save**. Google may then
+   report that the branding could not be verified (pages unreachable, domain
+   not registered to you): ignore it and do not request a re-verification.
+   That check only decides whether your application name is shown to users;
+   publishing works without it.
+6. **Audience → Publish app → Confirm**. A published application needs no
+   test users, and its authorization does not expire; left in *Testing*,
+   Google cancels the authorization after 7 days and the backups stop.
+7. **Clients → Create client**: application type **Desktop app**, then
+   **Create**. Google displays the **client ID** (ending in
+   `.apps.googleusercontent.com`) and the **client secret**.
+
+There is no need to add test users: the console may even refuse your own
+address ("Ineligible accounts not added"), which is of no consequence once
+the application is published.
+
+At sign-in, Google then shows an "unverified app" warning (**Advanced → Go
+to rclone**): this is expected for a personal client and needs no
+verification.
+
+Google renames these menus from time to time; the reference procedure, kept
+up to date by the rclone project, is at
+<https://rclone.org/drive/#making-your-own-client-id>.
+
+#### Connect
+
+1. Start the guided configuration; at the `Client ID >` and
+   `Client secret >` prompts, enter the two values obtained above.
+2. The authorization screen displays the exact command to run on your
+   computer. Unlike OneDrive, it carries a second argument that encodes your
+   client, so copy it as displayed:
+   ```
+   rclone authorize "drive" "eyJjbGllbnRfaWQiOi…"
+   ```
+3. Sign in to Google in the browser, accept, then paste the token on the
+   server, exactly as in steps 3 and 4 of the OneDrive procedure.
+4. The tool asks whether to configure a Shared Drive (answer No for a
+   personal drive), then tests the connection.
+
+Replacing and removing the connection work as for OneDrive. To withdraw the
+authorization on Google's side: <https://myaccount.google.com/connections>.
+
 ### 2. Encryption
+
+A single passphrase protects every destination.
 
 **Configuration → Encryption** offers to generate a random passphrase
 (recommended) or to enter your own.
@@ -270,7 +350,7 @@ backups in place, without uploading them again.
 
 | Setting | Default | Purpose |
 |---|---|---|
-| OneDrive folder | `pve-backups/<node>` | Where the backups live in OneDrive |
+| Folder on the destinations | `pve-backups/<node>` | Where the backups live, on each destination |
 | Local staging folder | `/var/lib/vz/dump` | Where `vzdump` writes the archive before upload. Pick a storage with enough free space |
 | vzdump mode | `snapshot` | `snapshot` (no downtime), `suspend` or `stop` |
 | Compression | `zstd` | `zstd`, `gzip`, `lzo` or none |
@@ -280,7 +360,8 @@ backups in place, without uploading them again.
 ## Backing up
 
 Menu **1 – Back up virtual machines and containers**: select the guests (space bar),
-confirm. `vzdump` and then the upload each show a progress bar in the
+confirm. When several destinations are configured, the tool first asks which
+ones to use; the archive is created once and uploaded to each of them. `vzdump` and then the upload each show a progress bar in the
 terminal (percentage, size, speed, time). A container archive reports no
 percentage, so the size written so far is shown instead. A failure on one guest does not stop the following ones; the final
 summary gives the number of successes.
@@ -289,6 +370,10 @@ Tip: run the tool inside `tmux` or `screen` for large backups, so that a
 dropped SSH session does not interrupt the upload.
 
 ## Managing backups on OneDrive
+
+When several destinations are configured, the tool first asks which one to
+manage; each destination has its own list, and the retention settings apply
+to each of them separately.
 
 Menu **3 – Manage the backups on OneDrive**:
 
@@ -329,11 +414,12 @@ name before starting the copy if the original is still running.
 
 ## Disaster recovery (server lost)
 
-You need: access to the OneDrive account and the **passphrase**.
+You need: access to the OneDrive or Google account and the **passphrase**.
 
 1. Install Proxmox VE on the new server, then onedrivepbs (`./install.sh`).
-2. **Configuration → OneDrive connection**: redo the authorization.
-3. **Configuration → OneDrive folder**: enter the old server's folder, e.g.
+2. **Configuration → OneDrive connection** (or **Google Drive connection**):
+   redo the authorization.
+3. **Configuration → Folder on the destinations**: enter the old server's folder, e.g.
    `pve-backups/old-name` (the default uses the new node's name).
 4. **Configuration → Encryption → Enter a passphrase**: enter the
    original passphrase.
@@ -376,8 +462,8 @@ which backs up its guests immediately, with the progress on screen, without
 changing the schedule. Several schedules can coexist, for instance a daily one for a
 critical guest and a weekly one for everything. Each schedule defines:
 
-- the destination, among those that are configured (the question is skipped
-  while OneDrive is the only one);
+- the destinations, among those that are configured (the question is
+  skipped when there is only one);
 - the frequency: daily, or weekly on a given day;
 - the start time (HH:MM);
 - the guests: either **all guests on the node**, which includes those added
@@ -392,10 +478,14 @@ Subcommands you can use in your own scripts:
 ```
 onedrivepbs backup --all       # every guest on the node
 onedrivepbs backup 100 101     # specific guests
-onedrivepbs backup --to onedrive --all   # explicit destination
-onedrivepbs list               # backups stored on OneDrive
+onedrivepbs backup --to gdrive --all            # one destination only
+onedrivepbs backup --to onedrive,gdrive 100     # several destinations
+onedrivepbs list               # stored backups
 onedrivepbs prune              # apply retention
 ```
+
+Destinations are named `onedrive` and `gdrive`. Without `--to`, every
+configured destination is used; `list` and `prune` accept `--to` as well.
 
 `backup` returns the number of failures as its exit status (0 = everything
 succeeded). A lock prevents two operations from running at the same time:
@@ -406,9 +496,9 @@ succeeded). A lock prevents two operations from running at the same time:
 | File | Contents | Permissions |
 |---|---|---|
 | `/usr/local/bin/onedrivepbs` | The tool | 755 |
-| `/etc/onedrivepbs/rclone.conf` | **OneDrive token and passphrase** | 600, folder 700 |
+| `/etc/onedrivepbs/rclone.conf` | **Access tokens (OneDrive, Google Drive) and passphrase** | 600, folder 700 |
 | `/etc/onedrivepbs/config` | Settings (no secrets) | 600 |
-| `/etc/cron.d/onedrivepbs` | Schedule | 644 |
+| `/etc/cron.d/onedrivepbs` | Schedules | 644 |
 | `/var/log/onedrivepbs.log` | Operations log | — |
 
 Good to know:
@@ -437,7 +527,7 @@ Good to know:
 | Connection test fails after a few months | Token expired or revoked: redo **OneDrive connection** |
 | `vzdump` fails for lack of space | Change the **local staging folder** to a larger storage |
 | Very slow upload or 429 errors | Microsoft is throttling; rclone retries by itself. Avoid peak hours |
-| Empty list although OneDrive contains files | Wrong passphrase or wrong **OneDrive folder** |
+| Empty list although OneDrive contains files | Wrong passphrase or wrong **Folder on the destinations** |
 | "Another onedrivepbs operation is already in progress" | Wait for the scheduled backup to finish, or check with `ps aux \| grep onedrivepbs` |
 | Restoring under the original ID fails | The existing guest must be stopped and not locked |
 
@@ -448,8 +538,9 @@ The details of each operation (`vzdump` and `rclone` output) are in
 
 - One node at a time: the tool backs up the guests of the node it runs on.
 - Full backups only (no incremental, no deduplication): each version takes
-  its whole compressed size on OneDrive.
-- Maximum file size on OneDrive: 250 GB per archive.
+  its whole compressed size on the destination.
+- Maximum file size on OneDrive: 250 GB per archive. Google Drive accepts
+  larger files but limits uploads to 750 GB per day.
 - Local space for the compressed archive is needed, for backup as well as
   for restore.
 - Restore only exists in the menus (no subcommand).
