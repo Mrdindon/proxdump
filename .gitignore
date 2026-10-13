@@ -1,0 +1,30 @@
+# Rien de ce qui suit ne doit jamais être versionné : secrets et données.
+
+# Configuration et secrets (jeton OAuth OneDrive, phrase secrète de chiffrement)
+rclone.conf
+rclone.conf.*
+*.conf.bak
+/config
+/etc/
+.env
+.env.*
+*.token
+*.key
+*.pem
+
+# Archives de sauvegarde
+*.vma
+*.vma.*
+*.tar.zst
+*.tar.gz
+*.tar.lzo
+dump/
+
+# Journaux et fichiers temporaires
+*.log
+*.lock
+*.tmp
+onedrivepbs.*/
+
+# Outils locaux
+.claude/

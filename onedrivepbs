@@ -1,0 +1,965 @@
+#!/usr/bin/env bash
+# onedrivepbs — sauvegarde chiffrée des VM/conteneurs Proxmox VE vers Microsoft OneDrive
+#
+# Chaîne : vzdump (archive locale temporaire) -> rclone crypt -> OneDrive
+# Interface : menus whiptail, ou sous-commandes non interactives (cron).
+#
+# Licence MIT — voir LICENSE.
+
+set -u
+set -o pipefail
+
+VERSION="1.0.0"
+TITLE="onedrivepbs $VERSION"
+
+CONF_DIR="${ONEDRIVEPBS_CONF_DIR:-/etc/onedrivepbs}"
+CONF_FILE="$CONF_DIR/config"
+LOG_FILE="${ONEDRIVEPBS_LOG:-/var/log/onedrivepbs.log}"
+LOCK_FILE="${ONEDRIVEPBS_LOCK:-/run/lock/onedrivepbs.lock}"
+CRON_FILE="${ONEDRIVEPBS_CRON:-/etc/cron.d/onedrivepbs}"
+export RCLONE_CONFIG="$CONF_DIR/rclone.conf"
+
+# --- Valeurs par défaut (écrasées par $CONF_FILE) ---------------------------
+BASE_REMOTE="onedrive"            # remote rclone pointant sur OneDrive
+CRYPT_REMOTE="onedrive-crypt"     # remote rclone « crypt » posé par-dessus
+REMOTE_DIR="pve-backups/$(hostname -s)"   # dossier sur OneDrive
+STAGING_DIR="/var/lib/vz/dump"    # dossier local temporaire (archives vzdump)
+KEEP_DEFAULT=3                    # versions conservées par invité (0 = tout)
+VZDUMP_MODE="snapshot"            # snapshot | suspend | stop
+COMPRESS="zstd"                   # zstd | gzip | lzo | 0
+BWLIMIT=""                        # limite de débit rclone (ex. 10M), vide = aucune
+VERIFY=1                          # vérifier les sommes après envoi
+declare -A KEEP_BY_ID=()          # rétention propre à un invité : KEEP_BY_ID[100]=5
+
+CLEANUP_DIRS=()
+
+# --- Utilitaires -------------------------------------------------------------
+
+log() {
+    local line
+    line="$(date '+%F %T') $*"
+    echo "$line" >>"$LOG_FILE" 2>/dev/null
+    echo "$*"
+}
+
+die() {
+    log "ERREUR: $*" >&2
+    exit 1
+}
+
+cleanup() {
+    local d
+    for d in "${CLEANUP_DIRS[@]:-}"; do
+        [[ -n $d && -d $d ]] && rm -rf -- "$d"
+    done
+}
+trap cleanup EXIT
+trap 'echo; log "Interrompu."; exit 130' INT TERM
+
+load_config() {
+    # shellcheck disable=SC1090
+    [[ -r $CONF_FILE ]] && source "$CONF_FILE"
+    return 0
+}
+
+save_config() {
+    local v id
+    install -d -m 700 "$CONF_DIR"
+    {
+        echo "# onedrivepbs — généré automatiquement, ne contient aucun secret"
+        for v in BASE_REMOTE CRYPT_REMOTE REMOTE_DIR STAGING_DIR KEEP_DEFAULT \
+                 VZDUMP_MODE COMPRESS BWLIMIT VERIFY; do
+            printf '%s=%q\n' "$v" "${!v}"
+        done
+        for id in "${!KEEP_BY_ID[@]}"; do
+            printf 'KEEP_BY_ID[%s]=%q\n' "$id" "${KEEP_BY_ID[$id]}"
+        done
+    } >"$CONF_FILE.tmp"
+    chmod 600 "$CONF_FILE.tmp"
+    mv "$CONF_FILE.tmp" "$CONF_FILE"
+}
+
+check_deps() {
+    local missing=() c
+    for c in whiptail rclone jq vzdump pvesh qmrestore pct flock numfmt; do
+        command -v "$c" >/dev/null || missing+=("$c")
+    done
+    ((${#missing[@]} == 0)) || die "commandes manquantes: ${missing[*]} (lancez install.sh)"
+}
+
+acquire_lock() {
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || {
+        log "Une autre opération onedrivepbs est déjà en cours."
+        return 1
+    }
+}
+
+release_lock() {
+    flock -u 9 2>/dev/null
+    exec 9>&-
+}
+
+has_remote() {
+    rclone listremotes 2>/dev/null | grep -qxF "$1:"
+}
+
+is_ready() {
+    has_remote "$BASE_REMOTE" && has_remote "$CRYPT_REMOTE"
+}
+
+human_size() {
+    numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "$1"
+}
+
+human_ts() { # 2026_10_12-18_00_00 -> 2026-10-12 18:00
+    local t=$1
+    echo "${t:0:4}-${t:5:2}-${t:8:2} ${t:11:2}:${t:14:2}"
+}
+
+keep_for() {
+    echo "${KEEP_BY_ID[$1]:-$KEEP_DEFAULT}"
+}
+
+# Options rclone communes aux transferts
+rclone_xfer_opts() {
+    XFER_OPTS=(--log-file "$LOG_FILE" --log-level INFO --retries 5 --low-level-retries 20)
+    [[ -n $BWLIMIT ]] && XFER_OPTS+=(--bwlimit "$BWLIMIT")
+    if [[ -t 1 ]]; then
+        XFER_OPTS+=(--progress --stats 2s)
+    else
+        XFER_OPTS+=(--stats 5m --stats-one-line)
+    fi
+}
+
+# --- Inventaire --------------------------------------------------------------
+
+# Invités du nœud local. TSV : vmid, type (qemu|lxc), nom, état
+guest_list() {
+    local node
+    node=$(hostname -s)
+    {
+        pvesh get "/nodes/$node/qemu" --output-format json 2>/dev/null |
+            jq -r '.[] | [(.vmid|tostring), "qemu", (.name // "-"), .status] | @tsv'
+        pvesh get "/nodes/$node/lxc" --output-format json 2>/dev/null |
+            jq -r '.[] | [(.vmid|tostring), "lxc", (.name // "-"), .status] | @tsv'
+    } | sort -n
+}
+
+# Sauvegardes présentes sur OneDrive, plus récentes d'abord pour chaque invité.
+# TSV : vmid, horodatage, type, nom, taille (octets), chemin
+remote_list() {
+    local json err
+    err=$(mktemp)
+    if ! json=$(rclone lsjson -R --files-only "$CRYPT_REMOTE:" 2>"$err"); then
+        # dossier pas encore créé = aucune sauvegarde, ce n'est pas une erreur
+        if grep -q "directory not found" "$err"; then
+            rm -f "$err"
+            return 0
+        fi
+        cat "$err" >>"$LOG_FILE"
+        rm -f "$err"
+        return 1
+    fi
+    rm -f "$err"
+    jq -r '
+        .[]
+        | select(.Name | test("^vzdump-(qemu|lxc)-[0-9]+-[0-9_]+-[0-9_]+\\.(vma|tar)(\\.(zst|gz|lzo))?$"))
+        | (.Name | capture("^vzdump-(?<t>qemu|lxc)-(?<id>[0-9]+)-(?<ts>[0-9_]+-[0-9_]+)\\.")) as $m
+        | [ $m.id, $m.ts, $m.t,
+            (.Path | split("/") | if length > 1 then (.[0] | sub("^[0-9]+_"; "")) else "-" end),
+            (.Size|tostring), .Path ]
+        | @tsv' <<<"$json" | sort -t$'\t' -k1,1n -k2,2r
+}
+
+# Supprime une sauvegarde et ses fichiers compagnons (.log)
+delete_backup() { # chemin de l'archive sur le remote
+    local path=$1 dir file prefix
+    dir=$(dirname "$path")
+    [[ $dir == "." ]] && dir=""
+    file=$(basename "$path")
+    [[ $file =~ ^(vzdump-(qemu|lxc)-[0-9]+-[0-9_]+-[0-9_]+)\. ]] || return 1
+    prefix=${BASH_REMATCH[1]}
+    rclone delete "$CRYPT_REMOTE:$dir" --include "/$prefix.*" \
+        --log-file "$LOG_FILE" --log-level INFO </dev/null
+}
+
+# Applique la rétention (à tous les invités, ou à un seul si vmid fourni)
+prune_remote() {
+    local only=${1:-} id ts type name size path keep prev="" n=0 deleted=0
+    while IFS=$'\t' read -r id ts type name size path; do
+        [[ -n $only && $id != "$only" ]] && continue
+        if [[ $id != "$prev" ]]; then
+            prev=$id
+            n=0
+        fi
+        n=$((n + 1))
+        keep=$(keep_for "$id")
+        ((keep > 0 && n > keep)) || continue
+        log "Rétention ($keep version(s) pour $id) : suppression de $path"
+        if delete_backup "$path"; then
+            deleted=$((deleted + 1))
+        else
+            log "ERREUR: suppression de $path impossible"
+        fi
+    done < <(remote_list)
+    ((deleted > 0)) && rclone rmdirs "$CRYPT_REMOTE:" --leave-root 2>>"$LOG_FILE"
+    log "Rétention : $deleted sauvegarde(s) supprimée(s)."
+}
+
+# --- Sauvegarde --------------------------------------------------------------
+
+backup_guest() { # vmid type nom
+    local id=$1 type=$2 name=$3 tmp archive safe dest rc
+    safe=$(tr -c 'A-Za-z0-9.-' '-' <<<"$name" | sed 's/-*$//')
+    dest="${id}_${safe:-invite}"
+
+    [[ -d $STAGING_DIR && -w $STAGING_DIR ]] ||
+        { log "ERREUR: dossier temporaire $STAGING_DIR inutilisable"; return 1; }
+    tmp=$(mktemp -d "$STAGING_DIR/onedrivepbs.XXXXXX") || return 1
+    CLEANUP_DIRS+=("$tmp")
+    # un conteneur non privilégié est archivé par un uid décalé, qui doit
+    # pouvoir traverser le dossier (sans pouvoir en lister le contenu)
+    chmod 711 "$tmp"
+
+    log "=== Sauvegarde de $type $id ($name) ==="
+    vzdump "$id" --dumpdir "$tmp" --mode "$VZDUMP_MODE" --compress "$COMPRESS" 2>&1 |
+        tee -a "$LOG_FILE"
+    rc=${PIPESTATUS[0]}
+    archive=$(find "$tmp" -maxdepth 1 -type f \( -name 'vzdump-*.vma*' -o -name 'vzdump-*.tar*' \) | head -n1)
+    if ((rc != 0)) || [[ -z $archive ]]; then
+        log "ERREUR: vzdump a échoué pour $id (code $rc)"
+        rm -rf -- "$tmp"
+        return 1
+    fi
+
+    log "Envoi chiffré de $(basename "$archive") ($(human_size "$(stat -c %s "$archive")")) vers OneDrive…"
+    rclone_xfer_opts
+    if ! rclone copy "$tmp" "$CRYPT_REMOTE:$dest" "${XFER_OPTS[@]}"; then
+        log "ERREUR: envoi vers OneDrive échoué pour $id"
+        rm -rf -- "$tmp"
+        return 1
+    fi
+
+    if [[ $VERIFY == 1 ]]; then
+        log "Vérification des sommes de contrôle…"
+        if ! rclone cryptcheck "$tmp" "$CRYPT_REMOTE:$dest" --one-way \
+            --log-file "$LOG_FILE" --log-level NOTICE; then
+            log "ERREUR: vérification échouée pour $id — la copie distante est suspecte"
+            rm -rf -- "$tmp"
+            return 1
+        fi
+    fi
+
+    rm -rf -- "$tmp"
+    log "Sauvegarde de $id terminée."
+    prune_remote "$id"
+}
+
+# Sauvegarde une liste d'invités ; code de retour = nombre d'échecs
+backup_guests() { # vmid…
+    local id type name status failed=0 found guests
+    is_ready || { log "ERREUR: OneDrive ou le chiffrement n'est pas configuré"; return 1; }
+    acquire_lock || return 1
+    guests=$(guest_list)
+    for id in "$@"; do
+        found=0
+        while IFS=$'\t' read -r gid type name status; do
+            if [[ $gid == "$id" ]]; then
+                found=1
+                backup_guest "$id" "$type" "$name" </dev/null || failed=$((failed + 1))
+                break
+            fi
+        done <<<"$guests"
+        ((found)) || { log "ERREUR: invité $id introuvable sur ce nœud"; failed=$((failed + 1)); }
+    done
+    release_lock
+    log "Terminé : $(($# - failed))/$# sauvegarde(s) réussie(s)."
+    return "$failed"
+}
+
+# --- Interface whiptail ------------------------------------------------------
+
+dims() {
+    local rows cols
+    read -r rows cols < <(stty size 2>/dev/null || echo "24 80")
+    H=$((rows - 4)); ((H > 30)) && H=30; ((H < 16)) && H=16
+    W=$((cols - 6)); ((W > 100)) && W=100; ((W < 60)) && W=60
+    LH=$((H - 9))
+}
+
+msg() { dims; whiptail --title "$TITLE" --msgbox "$1" "$H" "$W"; }
+confirm() { dims; whiptail --title "$TITLE" --yesno "$1" "$H" "$W"; }
+confirm_no() { dims; whiptail --title "$TITLE" --defaultno --yesno "$1" "$H" "$W"; }
+input() { dims; whiptail --title "$TITLE" --inputbox "$1" "$H" "$W" "${2:-}" 3>&1 1>&2 2>&3; }
+password() { dims; whiptail --title "$TITLE" --passwordbox "$1" "$H" "$W" 3>&1 1>&2 2>&3; }
+menu() { # texte, puis paires étiquette/libellé
+    local text=$1
+    shift
+    dims
+    whiptail --title "$TITLE" --menu "$text" "$H" "$W" "$LH" "$@" 3>&1 1>&2 2>&3
+}
+checklist() { # texte, puis triplets étiquette/libellé/état
+    local text=$1
+    shift
+    dims
+    whiptail --title "$TITLE" --separate-output --checklist "$text" "$H" "$W" "$LH" "$@" 3>&1 1>&2 2>&3
+}
+pause() { echo; read -rp "Appuyez sur Entrée pour revenir au menu… " _; }
+
+need_ready() {
+    is_ready && return 0
+    msg "OneDrive et/ou le chiffrement ne sont pas encore configurés.\n\nPassez d'abord par « Configuration »."
+    return 1
+}
+
+# Charge la liste distante dans le tableau BACKUPS (une ligne TSV par entrée)
+load_backups() {
+    local out
+    echo "Lecture des sauvegardes sur OneDrive…"
+    if ! out=$(remote_list); then
+        msg "Impossible de lire OneDrive. Vérifiez la connexion (Configuration > Tester)."
+        return 1
+    fi
+    BACKUPS=()
+    [[ -n $out ]] && mapfile -t BACKUPS <<<"$out"
+    return 0
+}
+
+backup_label() { # ligne TSV -> libellé lisible
+    local id ts type name size path
+    IFS=$'\t' read -r id ts type name size path <<<"$1"
+    printf '%-5s %-4s %-18.18s %s %9s' "$id" "$type" "$name" "$(human_ts "$ts")" "$(human_size "$size")"
+}
+
+ui_backup() {
+    need_ready || return
+    local items=() id type name status sel free
+    while IFS=$'\t' read -r id type name status; do
+        [[ -n $id ]] && items+=("$id" "$(printf '%-4s %-22.22s %s' "$type" "$name" "$status")" OFF)
+    done < <(guest_list)
+    ((${#items[@]})) || { msg "Aucune VM ni conteneur sur ce nœud."; return; }
+    free=$(df -h --output=avail "$STAGING_DIR" 2>/dev/null | tail -n1 | tr -d ' ')
+    sel=$(checklist "Invités à sauvegarder (Espace pour cocher)\n\nDossier temporaire : $STAGING_DIR (${free:-?} libres)\nMode : $VZDUMP_MODE — compression : $COMPRESS — rétention par défaut : $KEEP_DEFAULT" "${items[@]}") || return
+    [[ -n $sel ]] || return
+    clear
+    # shellcheck disable=SC2086
+    backup_guests $sel
+    pause
+}
+
+ui_list() {
+    need_ready || return
+    load_backups || return
+    ((${#BACKUPS[@]})) || { msg "Aucune sauvegarde sur OneDrive."; return; }
+    local tmp line total=0 size
+    tmp=$(mktemp)
+    {
+        printf '%-5s %-4s %-18s %-16s %9s\n' ID TYPE NOM DATE TAILLE
+        for line in "${BACKUPS[@]}"; do
+            backup_label "$line"
+            echo
+            size=$(cut -f5 <<<"$line")
+            total=$((total + size))
+        done
+        echo
+        echo "${#BACKUPS[@]} sauvegarde(s), $(human_size "$total") au total (taille avant chiffrement)"
+    } >"$tmp"
+    dims
+    whiptail --title "$TITLE — sauvegardes sur OneDrive" --scrolltext --textbox "$tmp" "$H" "$W"
+    rm -f "$tmp"
+}
+
+ui_delete() {
+    need_ready || return
+    load_backups || return
+    ((${#BACKUPS[@]})) || { msg "Aucune sauvegarde sur OneDrive."; return; }
+    local items=() i sel n=0
+    for i in "${!BACKUPS[@]}"; do
+        items+=("$i" "$(backup_label "${BACKUPS[$i]}")" OFF)
+    done
+    sel=$(checklist "Sauvegardes à SUPPRIMER de OneDrive (Espace pour cocher)" "${items[@]}") || return
+    [[ -n $sel ]] || return
+    n=$(wc -l <<<"$sel")
+    confirm_no "Supprimer définitivement $n sauvegarde(s) de OneDrive ?\n\n(Elles restent quelque temps dans la corbeille OneDrive, sous forme chiffrée.)" || return
+    clear
+    acquire_lock || { pause; return; }
+    for i in $sel; do
+        log "Suppression de $(cut -f6 <<<"${BACKUPS[$i]}")"
+        delete_backup "$(cut -f6 <<<"${BACKUPS[$i]}")" || log "ERREUR: suppression impossible"
+    done
+    rclone rmdirs "$CRYPT_REMOTE:" --leave-root 2>>"$LOG_FILE"
+    release_lock
+    pause
+}
+
+valid_count() { [[ $1 =~ ^[0-9]+$ ]]; }
+
+ui_retention() {
+    local choice v id items type name status
+    while :; do
+        choice=$(menu "Nombre de versions conservées par invité.\n0 = tout conserver (aucune purge)." \
+            D "Valeur par défaut : $KEEP_DEFAULT" \
+            I "Valeur propre à un invité (${#KEEP_BY_ID[@]} définie(s))" \
+            R "Retour") || return
+        case $choice in
+        D)
+            v=$(input "Versions conservées par défaut (0 = tout conserver) :" "$KEEP_DEFAULT") || continue
+            valid_count "$v" || { msg "Valeur invalide."; continue; }
+            KEEP_DEFAULT=$v
+            save_config
+            ;;
+        I)
+            items=()
+            while IFS=$'\t' read -r id type name status; do
+                [[ -n $id ]] && items+=("$id" "$(printf '%-22.22s garde : %s' "$name" "${KEEP_BY_ID[$id]:-défaut ($KEEP_DEFAULT)}")")
+            done < <(guest_list)
+            # invités disparus du nœud mais ayant encore un réglage
+            for id in "${!KEEP_BY_ID[@]}"; do
+                [[ " ${items[*]} " == *" $id "* ]] || items+=("$id" "(absent du nœud) garde : ${KEEP_BY_ID[$id]}")
+            done
+            ((${#items[@]})) || { msg "Aucun invité."; continue; }
+            id=$(menu "Choisir l'invité :" "${items[@]}") || continue
+            v=$(input "Versions conservées pour $id\n(vide = utiliser la valeur par défaut, 0 = tout conserver) :" "${KEEP_BY_ID[$id]:-}") || continue
+            if [[ -z $v ]]; then
+                unset "KEEP_BY_ID[$id]"
+            elif valid_count "$v"; then
+                KEEP_BY_ID[$id]=$v
+            else
+                msg "Valeur invalide."
+                continue
+            fi
+            save_config
+            ;;
+        R) return ;;
+        esac
+    done
+}
+
+ui_prune() {
+    need_ready || return
+    confirm_no "Appliquer la rétention maintenant ?\n\nPour chaque invité, les sauvegardes au-delà du nombre de versions configuré seront supprimées de OneDrive (les plus anciennes d'abord)." || return
+    clear
+    acquire_lock || { pause; return; }
+    prune_remote
+    release_lock
+    pause
+}
+
+ui_about() {
+    need_ready || return
+    local out
+    out=$(rclone about "$BASE_REMOTE:" 2>&1)
+    msg "Espace du compte OneDrive :\n\n$out"
+}
+
+ui_manage() {
+    local choice
+    while :; do
+        choice=$(menu "Gestion des sauvegardes stockées sur OneDrive" \
+            L "Lister les sauvegardes" \
+            S "Supprimer des sauvegardes" \
+            V "Versions conservées (rétention)" \
+            P "Appliquer la rétention maintenant" \
+            E "Espace utilisé sur OneDrive" \
+            R "Retour") || return
+        case $choice in
+        L) ui_list ;;
+        S) ui_delete ;;
+        V) ui_retention ;;
+        P) ui_prune ;;
+        E) ui_about ;;
+        R) return ;;
+        esac
+    done
+}
+
+# --- Restauration ------------------------------------------------------------
+
+guest_exists() {
+    compgen -G "/etc/pve/nodes/*/qemu-server/$1.conf" >/dev/null ||
+        compgen -G "/etc/pve/nodes/*/lxc/$1.conf" >/dev/null
+}
+
+pick_storage() { # type d'invité -> nom du stockage
+    local content=images items=() name stype status avail
+    [[ $1 == lxc ]] && content=rootdir
+    while read -r name stype status _ _ avail _; do
+        [[ $status == active ]] && items+=("$name" "$(printf '%-8s %s libres' "$stype" "$(human_size $((avail * 1024)))")")
+    done < <(pvesm status --content "$content" 2>/dev/null | tail -n +2)
+    ((${#items[@]})) || { msg "Aucun stockage actif n'accepte ce type de disque."; return 1; }
+    menu "Stockage de destination pour les disques :" "${items[@]}"
+}
+
+ui_restore() {
+    need_ready || return
+    load_backups || return
+    ((${#BACKUPS[@]})) || { msg "Aucune sauvegarde sur OneDrive."; return; }
+    local items=() i sel id ts type name size path action target storage tmp file rc
+    local force=() unique=() free
+    for i in "${!BACKUPS[@]}"; do
+        items+=("$i" "$(backup_label "${BACKUPS[$i]}")")
+    done
+    sel=$(menu "Sauvegarde à restaurer :" "${items[@]}") || return
+    IFS=$'\t' read -r id ts type name size path <<<"${BACKUPS[$sel]}"
+
+    action=$(menu "Sauvegarde : $type $id ($name) du $(human_ts "$ts"), $(human_size "$size")" \
+        O "Restaurer sous l'ID d'origine ($id)" \
+        N "Restaurer sous un nouvel ID (copie)" \
+        T "Télécharger seulement l'archive déchiffrée") || return
+
+    case $action in
+    O)
+        target=$id
+        if guest_exists "$target"; then
+            confirm_no "ATTENTION : l'invité $target existe déjà.\n\nLa restauration va ÉCRASER sa configuration et ses disques. Il doit être arrêté.\n\nContinuer ?" || return
+            force=(--force 1)
+        fi
+        ;;
+    N)
+        target=$(input "Nouvel ID :" "$(pvesh get /cluster/nextid 2>/dev/null)") || return
+        [[ $target =~ ^[0-9]+$ ]] || { msg "ID invalide."; return; }
+        guest_exists "$target" && { msg "L'ID $target est déjà utilisé."; return; }
+        confirm "Générer de nouvelles adresses MAC (recommandé si l'original tourne encore) ?" && unique=(--unique 1)
+        ;;
+    T)
+        target=$(input "Dossier de destination :" "$STAGING_DIR") || return
+        [[ -d $target && -w $target ]] || { msg "Dossier inexistant ou non inscriptible."; return; }
+        clear
+        acquire_lock || { pause; return; }
+        log "Téléchargement de $path vers $target"
+        rclone_xfer_opts
+        rclone copy "$CRYPT_REMOTE:$path" "$target" "${XFER_OPTS[@]}" &&
+            log "Archive disponible : $target/$(basename "$path")"
+        release_lock
+        pause
+        return
+        ;;
+    esac
+
+    storage=$(pick_storage "$type") || return
+    free=$(df --output=avail -B1 "$STAGING_DIR" 2>/dev/null | tail -n1 | tr -d ' ')
+    if [[ -n $free ]] && ((free < size)); then
+        msg "Espace insuffisant dans $STAGING_DIR pour télécharger l'archive ($(human_size "$size") requis, $(human_size "$free") libres).\n\nChangez le dossier temporaire dans Configuration."
+        return
+    fi
+
+    clear
+    acquire_lock || { pause; return; }
+    tmp=$(mktemp -d "$STAGING_DIR/onedrivepbs.XXXXXX") || { release_lock; pause; return; }
+    CLEANUP_DIRS+=("$tmp")
+    log "=== Restauration de $path vers $type $target (stockage $storage) ==="
+    rclone_xfer_opts
+    if rclone copy "$CRYPT_REMOTE:$path" "$tmp" "${XFER_OPTS[@]}"; then
+        file="$tmp/$(basename "$path")"
+        if [[ $type == qemu ]]; then
+            qmrestore "$file" "$target" --storage "$storage" "${force[@]}" "${unique[@]}" 2>&1 | tee -a "$LOG_FILE"
+        else
+            pct restore "$target" "$file" --storage "$storage" "${force[@]}" "${unique[@]}" 2>&1 | tee -a "$LOG_FILE"
+        fi
+        rc=${PIPESTATUS[0]}
+        if ((rc == 0)); then
+            log "Restauration terminée : $type $target."
+        else
+            log "ERREUR: la restauration a échoué (code $rc)."
+        fi
+    else
+        log "ERREUR: téléchargement depuis OneDrive échoué."
+    fi
+    rm -rf -- "$tmp"
+    release_lock
+    pause
+}
+
+# --- Configuration -----------------------------------------------------------
+
+# Pilote l'assistant de configuration rclone question par question
+onedrive_wizard() {
+    local out err bak state qname help def result n i items token
+    err=$(mktemp)
+    bak=$(mktemp)
+    [[ -f $RCLONE_CONFIG ]] && cp -p "$RCLONE_CONFIG" "$bak"
+    # en cas d'abandon ou d'erreur, on retrouve la configuration d'avant
+    wizard_abort() {
+        if [[ -s $bak ]]; then cp -p "$bak" "$RCLONE_CONFIG"; else rclone config delete "$BASE_REMOTE" 2>/dev/null; fi
+        rm -f "$err" "$bak"
+        return 1
+    }
+    rclone config delete "$BASE_REMOTE" 2>/dev/null
+    out=$(rclone config create "$BASE_REMOTE" onedrive config_is_local=false --non-interactive 2>"$err")
+    while :; do
+        state=$(jq -r '.State // ""' <<<"$out" 2>/dev/null)
+        if [[ -z $out || $(jq -r '.Error // ""' <<<"$out" 2>/dev/null) != "" ]]; then
+            msg "rclone a signalé une erreur :\n\n$(jq -r '.Error // ""' <<<"$out" 2>/dev/null)\n$(grep -i 'error' "$err" | tail -n 3)"
+            [[ -z $state ]] && { wizard_abort; return 1; }
+        fi
+        [[ -z $state ]] && break
+        qname=$(jq -r '.Option.Name' <<<"$out")
+        help=$(jq -r '.Option.Help' <<<"$out")
+        def=$(jq -r '.Option.DefaultStr // ""' <<<"$out")
+        n=$(jq -r '.Option.Examples | length' <<<"$out")
+
+        if [[ $qname == config_token ]]; then
+            clear
+            cat <<EOF
+Autorisation OneDrive (ce serveur n'a pas de navigateur)
+---------------------------------------------------------
+1. Sur un ordinateur disposant d'un navigateur ET de rclone (https://rclone.org/downloads/),
+   lancez :
+
+       rclone authorize "onedrive"
+
+2. Connectez-vous à votre compte Microsoft dans la page qui s'ouvre et acceptez.
+3. rclone affiche alors un bloc de texte entre « ---> » et « <---End paste ».
+   Copiez ce bloc (sans les flèches) et collez-le ci-dessous, sur une seule ligne.
+   Vous pouvez aussi indiquer le chemin d'un fichier contenant ce bloc.
+
+EOF
+            read -e -r -p "Jeton > " token || { wizard_abort; return 1; }
+            [[ -f $token ]] && token=$(tr -d '\n' <"$token")
+            [[ -n $token ]] || { wizard_abort; return 1; }
+            result=$token
+        elif ((n > 0)); then
+            items=()
+            for ((i = 0; i < n; i++)); do
+                items+=("$(jq -r ".Option.Examples[$i].Value" <<<"$out")" "$(jq -r ".Option.Examples[$i].Help" <<<"$out" | head -n1 | cut -c1-70)")
+            done
+            result=$(menu "$help" "${items[@]}") || { wizard_abort; return 1; }
+        elif [[ $(jq -r '.Option.Type' <<<"$out") == bool ]]; then
+            if confirm "$help"; then result=true; else result=false; fi
+        else
+            result=$(input "$help" "$def") || { wizard_abort; return 1; }
+        fi
+        out=$(rclone config update "$BASE_REMOTE" --continue --state "$state" --result "$result" --non-interactive 2>"$err")
+    done
+    rm -f "$err" "$bak"
+    chmod 600 "$RCLONE_CONFIG" 2>/dev/null
+    return 0
+}
+
+ui_setup_onedrive() {
+    local choice
+    if has_remote "$BASE_REMOTE"; then
+        confirm_no "Une connexion OneDrive (« $BASE_REMOTE ») existe déjà.\n\nLa remplacer ? (les sauvegardes déjà envoyées ne sont pas touchées)" || return
+    fi
+    choice=$(menu "Méthode de connexion à OneDrive" \
+        A "Assistant guidé (recommandé)" \
+        M "Configuration rclone manuelle (cas particuliers : SharePoint…)") || return
+    install -d -m 700 "$CONF_DIR"
+    case $choice in
+    A)
+        onedrive_wizard || { msg "Connexion OneDrive non terminée."; return; }
+        ;;
+    M)
+        msg "L'outil « rclone config » va s'ouvrir.\n\nCréez (n) un remote nommé exactement :\n\n    $BASE_REMOTE\n\nde type « onedrive », puis quittez (q)."
+        clear
+        rclone config
+        chmod 600 "$RCLONE_CONFIG" 2>/dev/null
+        ;;
+    esac
+    ui_test
+}
+
+ui_test() {
+    local out
+    has_remote "$BASE_REMOTE" || { msg "OneDrive n'est pas configuré."; return 1; }
+    echo "Test de la connexion OneDrive…"
+    if out=$(rclone about "$BASE_REMOTE:" 2>&1); then
+        msg "Connexion OneDrive OK.\n\n$out"
+    else
+        msg "ÉCHEC de la connexion OneDrive :\n\n$(tail -n 8 <<<"$out")"
+        return 1
+    fi
+}
+
+# Écrit la section crypt directement dans rclone.conf : la phrase secrète ne
+# passe ainsi jamais sur une ligne de commande visible dans « ps ».
+write_crypt_remote() { # phrase secrète
+    local obscured
+    obscured=$(printf '%s\n' "$1" | rclone obscure -) || return 1
+    install -d -m 700 "$CONF_DIR"
+    rclone config delete "$CRYPT_REMOTE" 2>/dev/null
+    touch "$RCLONE_CONFIG"
+    chmod 600 "$RCLONE_CONFIG"
+    printf '\n[%s]\ntype = crypt\nremote = %s:%s\npassword = %s\nfilename_encryption = standard\ndirectory_name_encryption = true\n' \
+        "$CRYPT_REMOTE" "$BASE_REMOTE" "$REMOTE_DIR" "$obscured" >>"$RCLONE_CONFIG"
+}
+
+current_passphrase() {
+    local obscured
+    obscured=$(rclone config dump 2>/dev/null | jq -r --arg n "$CRYPT_REMOTE" '.[$n].password // empty')
+    [[ -n $obscured ]] && rclone reveal "$obscured"
+}
+
+ui_setup_crypt() {
+    local choice p1 p2
+    if has_remote "$CRYPT_REMOTE"; then
+        choice=$(menu "Le chiffrement est déjà configuré." \
+            A "Afficher la phrase secrète (pour la mettre en lieu sûr)" \
+            C "Changer la phrase secrète" \
+            R "Retour") || return
+        case $choice in
+        A)
+            msg "Phrase secrète de chiffrement :\n\n$(current_passphrase)\n\nConservez-la HORS de ce serveur (gestionnaire de mots de passe, papier). Sans elle, les sauvegardes sont irrécupérables."
+            return
+            ;;
+        C)
+            confirm_no "ATTENTION : les sauvegardes déjà présentes sur OneDrive ont été chiffrées avec la phrase actuelle. Après changement, elles ne seront plus lisibles par cet outil (à moins de remettre l'ancienne phrase).\n\nContinuer ?" || return
+            ;;
+        *) return ;;
+        esac
+    fi
+    choice=$(menu "Phrase secrète de chiffrement\n\nElle protège le contenu ET les noms des fichiers envoyés sur OneDrive. Pour restaurer depuis un autre serveur, il faudra saisir exactement la même." \
+        G "Générer une phrase aléatoire forte (recommandé)" \
+        S "Saisir ma propre phrase (nouvelle, ou celle d'une installation existante)") || return
+    case $choice in
+    G)
+        p1=$(openssl rand -base64 33 | tr -d '\n')
+        ;;
+    S)
+        p1=$(password "Phrase secrète (12 caractères minimum) :") || return
+        p2=$(password "Confirmer la phrase secrète :") || return
+        [[ $p1 == "$p2" ]] || { msg "Les deux saisies diffèrent."; return; }
+        ((${#p1} >= 12)) || { msg "Phrase trop courte (12 caractères minimum)."; return; }
+        ;;
+    esac
+    write_crypt_remote "$p1" || { msg "Échec de l'enregistrement du chiffrement."; return; }
+    save_config
+    msg "Chiffrement configuré.\n\nPhrase secrète :\n\n$p1\n\nNOTEZ-LA MAINTENANT hors de ce serveur. Sans elle, aucune restauration n'est possible si ce serveur est perdu."
+}
+
+ui_remote_dir() {
+    local v
+    v=$(input "Dossier de destination sur OneDrive (créé au besoin).\n\nAttention : les sauvegardes existantes ne sont pas déplacées." "$REMOTE_DIR") || return
+    v=${v#/}
+    v=${v%/}
+    [[ -n $v ]] || { msg "Le dossier ne peut pas être vide."; return; }
+    REMOTE_DIR=$v
+    save_config
+    has_remote "$CRYPT_REMOTE" &&
+        rclone config update "$CRYPT_REMOTE" remote="$BASE_REMOTE:$REMOTE_DIR" --no-obscure >/dev/null 2>>"$LOG_FILE"
+}
+
+ui_staging() {
+    local items=() name stype status rest path v
+    while read -r name stype status rest; do
+        [[ $status == active && $stype =~ ^(dir|nfs|cifs|btrfs|cephfs)$ ]] || continue
+        path=$(pvesh get "/storage/$name" --output-format json 2>/dev/null | jq -r '.path // empty')
+        [[ -n $path ]] && items+=("$path/dump" "stockage $name — $(df -h --output=avail "$path" 2>/dev/null | tail -n1 | tr -d ' ') libres")
+    done < <(pvesm status --content backup 2>/dev/null | tail -n +2)
+    items+=("autre" "Saisir un autre chemin…")
+    v=$(menu "Dossier temporaire local\n\nChaque archive y est créée par vzdump, envoyée, puis effacée. Il faut assez d'espace pour la plus grosse sauvegarde.\n\nActuel : $STAGING_DIR" "${items[@]}") || return
+    [[ $v == autre ]] && { v=$(input "Chemin du dossier temporaire :" "$STAGING_DIR") || return; }
+    mkdir -p "$v" 2>/dev/null
+    [[ -d $v && -w $v ]] || { msg "Dossier inutilisable : $v"; return; }
+    STAGING_DIR=$v
+    save_config
+}
+
+ui_options() {
+    local choice v
+    while :; do
+        choice=$(menu "Options de sauvegarde" \
+            M "Mode vzdump : $VZDUMP_MODE" \
+            C "Compression : $COMPRESS" \
+            B "Limite de débit d'envoi : ${BWLIMIT:-aucune}" \
+            V "Vérification après envoi : $([[ $VERIFY == 1 ]] && echo oui || echo non)" \
+            R "Retour") || return
+        case $choice in
+        M)
+            v=$(menu "Mode vzdump" \
+                snapshot "Sans interruption (recommandé)" \
+                suspend "Suspension brève de l'invité" \
+                stop "Arrêt de l'invité pendant la sauvegarde (cohérence maximale)") || continue
+            VZDUMP_MODE=$v
+            ;;
+        C)
+            v=$(menu "Compression" \
+                zstd "Rapide et efficace (recommandé)" \
+                gzip "Compatible, plus lent" \
+                lzo "Très rapide, moins compact" \
+                0 "Aucune") || continue
+            COMPRESS=$v
+            ;;
+        B)
+            v=$(input "Limite de débit rclone (ex. 10M = 10 Mio/s ; vide = aucune) :" "$BWLIMIT") || continue
+            [[ -z $v || $v =~ ^[0-9]+(\.[0-9]+)?[BKMG]?$ ]] || { msg "Format invalide."; continue; }
+            BWLIMIT=$v
+            ;;
+        V) VERIFY=$((1 - VERIFY)) ;;
+        R) return ;;
+        esac
+        save_config
+    done
+}
+
+ui_config() {
+    local choice
+    while :; do
+        choice=$(menu "Configuration (stockée dans $CONF_DIR, lisible par root seulement)" \
+            O "Connexion OneDrive : $(has_remote "$BASE_REMOTE" && echo configurée || echo "À FAIRE")" \
+            C "Chiffrement : $(has_remote "$CRYPT_REMOTE" && echo configuré || echo "À FAIRE")" \
+            T "Tester la connexion OneDrive" \
+            D "Dossier OneDrive : $REMOTE_DIR" \
+            L "Dossier temporaire local : $STAGING_DIR" \
+            S "Options de sauvegarde" \
+            R "Retour") || return
+        case $choice in
+        O) ui_setup_onedrive ;;
+        C) ui_setup_crypt ;;
+        T) ui_test ;;
+        D) ui_remote_dir ;;
+        L) ui_staging ;;
+        S) ui_options ;;
+        R) return ;;
+        esac
+    done
+}
+
+# --- Planification -----------------------------------------------------------
+
+ui_schedule() {
+    local current="aucune" choice hour dow="*" items=() id type name status sel targets self
+    [[ -f $CRON_FILE ]] && current=$(grep -v '^#' "$CRON_FILE" | grep onedrivepbs | head -n1)
+    choice=$(menu "Sauvegarde automatique (cron)\n\nActuelle : $current" \
+        Q "Tous les jours" \
+        H "Une fois par semaine" \
+        D "Désactiver la planification" \
+        R "Retour") || return
+    case $choice in
+    R) return ;;
+    D)
+        rm -f "$CRON_FILE"
+        msg "Planification désactivée."
+        return
+        ;;
+    H)
+        dow=$(menu "Jour de la semaine" 1 Lundi 2 Mardi 3 Mercredi 4 Jeudi 5 Vendredi 6 Samedi 0 Dimanche) || return
+        ;;
+    esac
+    hour=$(input "Heure de lancement (0-23) :" "2") || return
+    [[ $hour =~ ^([0-9]|1[0-9]|2[0-3])$ ]] || { msg "Heure invalide."; return; }
+
+    items=(all "Tous les invités du nœud (y compris les futurs)" ON)
+    while IFS=$'\t' read -r id type name status; do
+        [[ -n $id ]] && items+=("$id" "$(printf '%-4s %s' "$type" "$name")" OFF)
+    done < <(guest_list)
+    sel=$(checklist "Invités à sauvegarder automatiquement" "${items[@]}") || return
+    [[ -n $sel ]] || return
+    if grep -qx all <<<"$sel"; then
+        targets="--all"
+    else
+        targets=$(tr '\n' ' ' <<<"$sel")
+    fi
+    self=$(command -v onedrivepbs || readlink -f "${BASH_SOURCE[0]}")
+    cat >"$CRON_FILE" <<EOF
+# Généré par onedrivepbs — modifiez via le menu « Planification »
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 $hour * * $dow root $self backup $targets >/dev/null 2>&1
+EOF
+    chmod 644 "$CRON_FILE"
+    msg "Planification enregistrée dans $CRON_FILE :\n\n$(tail -n1 "$CRON_FILE")\n\nLe déroulement est consigné dans $LOG_FILE."
+}
+
+ui_log() {
+    local tmp
+    [[ -s $LOG_FILE ]] || { msg "Journal vide."; return; }
+    tmp=$(mktemp)
+    tail -n 300 "$LOG_FILE" >"$tmp"
+    dims
+    whiptail --title "$TITLE — $LOG_FILE (300 dernières lignes)" --scrolltext --textbox "$tmp" "$H" "$W"
+    rm -f "$tmp"
+}
+
+main_menu() {
+    local choice
+    if ! is_ready; then
+        msg "Bienvenue dans onedrivepbs.\n\nAvant la première sauvegarde, ouvrez « Configuration » pour :\n\n  1. connecter votre compte OneDrive ;\n  2. définir la phrase secrète de chiffrement ;\n  3. choisir le dossier temporaire local."
+    fi
+    while :; do
+        choice=$(menu "Sauvegarde chiffrée Proxmox VE -> OneDrive   (nœud : $(hostname -s))" \
+            1 "Sauvegarder des VM / conteneurs" \
+            2 "Restaurer une sauvegarde" \
+            3 "Gérer les sauvegardes sur OneDrive" \
+            4 "Planification automatique" \
+            5 "Configuration" \
+            6 "Journal" \
+            Q "Quitter") || break
+        case $choice in
+        1) ui_backup ;;
+        2) ui_restore ;;
+        3) ui_manage ;;
+        4) ui_schedule ;;
+        5) ui_config ;;
+        6) ui_log ;;
+        Q) break ;;
+        esac
+    done
+    clear
+}
+
+# --- Ligne de commande -------------------------------------------------------
+
+usage() {
+    cat <<EOF
+onedrivepbs $VERSION — sauvegarde chiffrée Proxmox VE vers OneDrive
+
+Usage :
+  onedrivepbs                     ouvre les menus
+  onedrivepbs backup --all        sauvegarde tous les invités du nœud
+  onedrivepbs backup ID [ID…]     sauvegarde les invités indiqués
+  onedrivepbs list                liste les sauvegardes présentes sur OneDrive
+  onedrivepbs prune               applique la rétention
+  onedrivepbs --version | --help
+
+La restauration et la configuration se font par les menus.
+EOF
+}
+
+main() {
+    case ${1:-} in
+    -h | --help) usage; exit 0 ;;
+    --version) echo "$VERSION"; exit 0 ;;
+    esac
+    ((EUID == 0)) || die "onedrivepbs doit être lancé en root."
+    check_deps
+    load_config
+
+    local ids line
+    case ${1:-} in
+    "")
+        [[ -t 0 && -t 1 ]] || die "les menus nécessitent un terminal ; voir --help."
+        main_menu
+        ;;
+    backup)
+        shift
+        (($#)) || die "précisez --all ou au moins un ID."
+        if [[ $1 == --all ]]; then
+            ids=$(guest_list | cut -f1 | tr '\n' ' ')
+            [[ -n ${ids// /} ]] || die "aucun invité sur ce nœud."
+        else
+            ids="$*"
+        fi
+        # shellcheck disable=SC2086
+        backup_guests $ids
+        ;;
+    list)
+        is_ready || die "OneDrive ou le chiffrement n'est pas configuré."
+        while IFS= read -r line; do
+            backup_label "$line"
+            echo
+        done < <(remote_list)
+        ;;
+    prune)
+        is_ready || die "OneDrive ou le chiffrement n'est pas configuré."
+        acquire_lock || exit 1
+        prune_remote
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+    esac
+}
+
+main "$@"
