@@ -1,4 +1,4 @@
-# onedrivepbs
+# proxdump
 
 **Encrypted** backup of the virtual machines and containers of a
 **Proxmox VE** node to **Microsoft OneDrive** and/or **Google Drive**,
@@ -16,12 +16,12 @@ driven by `whiptail` menus.
 - cron scheduling and non-interactive subcommands.
 
 ```
-┌──────────────────────── onedrivepbs 1.0.0 ────────────────────────┐
-│ Encrypted backup of Proxmox VE to OneDrive (node: pve)            │
+┌───────────────────────── proxdump 1.0.0 ──────────────────────────┐
+│ Encrypted backup of Proxmox VE to cloud storage (node: pve)       │
 │                                                                   │
 │        1  Back up virtual machines and containers                 │
 │        2  Restore a backup                                        │
-│        3  Manage the backups on OneDrive                          │
+│        3  Manage the stored backups                               │
 │        4  Automatic scheduling                                    │
 │        5  Configuration                                           │
 │        6  Log                                                     │
@@ -105,31 +105,31 @@ package, Debian's being too old for OneDrive), `jq`, `whiptail`, `curl`.
 ## Installation
 
 ```bash
-git clone https://github.com/Mrdindon/onedrivepbs.git
-cd onedrivepbs
+git clone https://github.com/Mrdindon/proxdump.git
+cd proxdump
 ./install.sh
 ```
 
-The script copies the tool to `/usr/local/bin/onedrivepbs` and creates
-`/etc/onedrivepbs` (mode 700). To update: `git pull && ./install.sh`.
+The script copies the tool to `/usr/local/bin/proxdump` and creates
+`/etc/proxdump` (mode 700). To update: `git pull && ./install.sh`.
 To remove: `./install.sh --uninstall` (the configuration is kept).
 
 ## Initial configuration
 
-Run `onedrivepbs` as root and open **Configuration**. Three steps: connect
+Run `proxdump` as root and open **Configuration**. Three steps: connect
 at least one destination (OneDrive, Google Drive, or both), define the
 encryption passphrase, and review the folders and options.
 
 ### 1. OneDrive connection
 
-onedrivepbs reaches OneDrive through [rclone](https://rclone.org/). Microsoft
+proxdump reaches OneDrive through [rclone](https://rclone.org/). Microsoft
 only grants access through a sign-in page in a web browser, and a Proxmox
 server has none. The authorization is therefore performed **once, on another
 computer**, which produces a *token*; that token is then pasted into
-onedrivepbs on the server.
+proxdump on the server.
 
 ```
- Your computer (browser + rclone)                Proxmox server (onedrivepbs)
+ Your computer (browser + rclone)                Proxmox server (proxdump)
  ────────────────────────────────                ────────────────────────────
  rclone authorize "onedrive"
    └─ browser: Microsoft sign-in, "Accept"
@@ -156,12 +156,12 @@ onedrivepbs on the server.
 | Linux | `sudo -v ; curl https://rclone.org/install.sh \| sudo bash` |
 
 Prefer the same version as on the server; the authorization screen of
-onedrivepbs displays it (`rclone version` shows yours). Nothing has to be
+proxdump displays it (`rclone version` shows yours). Nothing has to be
 configured in rclone on your computer.
 
 #### Step 2 — Start the guided configuration on the server
 
-Run `onedrivepbs`, then **Configuration → OneDrive connection → Guided
+Run `proxdump`, then **Configuration → OneDrive connection → Guided
 configuration**. The tool displays the instructions below and waits at the
 `Token >` prompt. Leave it there.
 
@@ -220,7 +220,7 @@ The tool ends with a test that displays the total and free space of the
 account. It can be run again at any time with **Configuration → Test the
 connections**.
 
-The token is saved in `/etc/onedrivepbs/rclone.conf`, readable by root only,
+The token is saved in `/etc/proxdump/rclone.conf`, readable by root only,
 and rclone renews it automatically. The authorization only has to be redone
 if access is withdrawn or if the token goes unused for more than 90 days.
 
@@ -416,7 +416,7 @@ name before starting the copy if the original is still running.
 
 You need: access to the OneDrive or Google account and the **passphrase**.
 
-1. Install Proxmox VE on the new server, then onedrivepbs (`./install.sh`).
+1. Install Proxmox VE on the new server, then proxdump (`./install.sh`).
 2. **Configuration → OneDrive connection** (or **Google Drive connection**):
    redo the authorization.
 3. **Configuration → Folder on the destinations**: enter the old server's folder, e.g.
@@ -469,19 +469,19 @@ critical guest and a weekly one for everything. Each schedule defines:
 - the guests: either **all guests on the node**, which includes those added
   later, or **a selection** of guests.
 
-The schedules are stored in `/etc/cron.d/onedrivepbs`, one line each. A
+The schedules are stored in `/etc/cron.d/proxdump`, one line each. A
 schedule that starts while another backup is still running waits for its
 turn (up to 12 hours).
 
 Subcommands you can use in your own scripts:
 
 ```
-onedrivepbs backup --all       # every guest on the node
-onedrivepbs backup 100 101     # specific guests
-onedrivepbs backup --to gdrive --all            # one destination only
-onedrivepbs backup --to onedrive,gdrive 100     # several destinations
-onedrivepbs list               # stored backups
-onedrivepbs prune              # apply retention
+proxdump backup --all       # every guest on the node
+proxdump backup 100 101     # specific guests
+proxdump backup --to gdrive --all            # one destination only
+proxdump backup --to onedrive,gdrive 100     # several destinations
+proxdump list               # stored backups
+proxdump prune              # apply retention
 ```
 
 Destinations are named `onedrive` and `gdrive`. Without `--to`, every
@@ -495,11 +495,11 @@ succeeded). A lock prevents two operations from running at the same time:
 
 | File | Contents | Permissions |
 |---|---|---|
-| `/usr/local/bin/onedrivepbs` | The tool | 755 |
-| `/etc/onedrivepbs/rclone.conf` | **Access tokens (OneDrive, Google Drive) and passphrase** | 600, folder 700 |
-| `/etc/onedrivepbs/config` | Settings (no secrets) | 600 |
-| `/etc/cron.d/onedrivepbs` | Schedules | 644 |
-| `/var/log/onedrivepbs.log` | Operations log | — |
+| `/usr/local/bin/proxdump` | The tool | 755 |
+| `/etc/proxdump/rclone.conf` | **Access tokens (OneDrive, Google Drive) and passphrase** | 600, folder 700 |
+| `/etc/proxdump/config` | Settings (no secrets) | 600 |
+| `/etc/cron.d/proxdump` | Schedules | 644 |
+| `/var/log/proxdump.log` | Operations log | — |
 
 Good to know:
 
@@ -516,7 +516,7 @@ Good to know:
 - File names (guest IDs and names, backup dates), sizes and upload dates
   remain visible on the OneDrive side; only the contents are encrypted.
 - This repository contains no credentials, token or passphrase: all of that
-  lives only in `/etc/onedrivepbs`, and the `.gitignore` excludes those files.
+  lives only in `/etc/proxdump`, and the `.gitignore` excludes those files.
 
 ## Troubleshooting
 
@@ -528,11 +528,11 @@ Good to know:
 | `vzdump` fails for lack of space | Change the **local staging folder** to a larger storage |
 | Very slow upload or 429 errors | Microsoft is throttling; rclone retries by itself. Avoid peak hours |
 | Empty list although OneDrive contains files | Wrong passphrase or wrong **Folder on the destinations** |
-| "Another onedrivepbs operation is already in progress" | Wait for the scheduled backup to finish, or check with `ps aux \| grep onedrivepbs` |
+| "Another proxdump operation is already in progress" | Wait for the scheduled backup to finish, or check with `ps aux \| grep proxdump` |
 | Restoring under the original ID fails | The existing guest must be stopped and not locked |
 
 The details of each operation (`vzdump` and `rclone` output) are in
-`/var/log/onedrivepbs.log`, also viewable through the **Log** menu.
+`/var/log/proxdump.log`, also viewable through the **Log** menu.
 
 ## Known limitations
 
@@ -553,11 +553,11 @@ touching the real configuration or a real OneDrive account, you can redirect
 its files and use a local folder as a fake OneDrive:
 
 ```bash
-export ONEDRIVEPBS_CONF_DIR=/tmp/odp/conf ONEDRIVEPBS_LOG=/tmp/odp/log \
-       ONEDRIVEPBS_LOCK=/tmp/odp/lock ONEDRIVEPBS_CRON=/tmp/odp/cron
+export PROXDUMP_CONF_DIR=/tmp/odp/conf PROXDUMP_LOG=/tmp/odp/log \
+       PROXDUMP_LOCK=/tmp/odp/lock PROXDUMP_CRON=/tmp/odp/cron
 mkdir -p /tmp/odp/conf /tmp/odp/fake-onedrive
 printf '[onedrive]\ntype = alias\nremote = /tmp/odp/fake-onedrive\n' > /tmp/odp/conf/rclone.conf
-./onedrivepbs      # then Configuration → Encryption, and a trial backup
+./proxdump      # then Configuration → Encryption, and a trial backup
 ```
 
 ## License

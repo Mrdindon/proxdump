@@ -24,7 +24,7 @@ dump/
 *.log
 *.lock
 *.tmp
-onedrivepbs.*/
+proxdump.*/
 
 # Local tooling
 .claude/

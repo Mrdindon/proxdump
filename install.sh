@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# Installs onedrivepbs and its dependencies on a Proxmox VE node.
+# Installs proxdump and its dependencies on a Proxmox VE node.
 #   ./install.sh              install or update
 #   ./install.sh --uninstall  remove the tool (the configuration is kept)
 
 set -euo pipefail
 
-BIN=/usr/local/bin/onedrivepbs
-CONF_DIR=/etc/onedrivepbs
+BIN=/usr/local/bin/proxdump
+CONF_DIR=/etc/proxdump
 RCLONE_MIN="1.65"
 SRC_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 ((EUID == 0)) || { echo "Must be run as root." >&2; exit 1; }
 
 if [[ ${1:-} == --uninstall ]]; then
-    rm -f "$BIN" /etc/cron.d/onedrivepbs
-    echo "onedrivepbs removed."
-    echo "Kept on purpose: $CONF_DIR (OneDrive token, passphrase) and /var/log/onedrivepbs.log."
-    echo "To erase everything: rm -rf $CONF_DIR /var/log/onedrivepbs.log"
+    rm -f "$BIN" /etc/cron.d/proxdump
+    echo "proxdump removed."
+    echo "Kept on purpose: $CONF_DIR (OneDrive token, passphrase) and /var/log/proxdump.log."
+    echo "To erase everything: rm -rf $CONF_DIR /var/log/proxdump.log"
     exit 0
 fi
 
@@ -51,9 +51,9 @@ if ! rclone_ok; then
     dpkg -i "$tmp/rclone.deb"
 fi
 
-install -m 755 "$SRC_DIR/onedrivepbs" "$BIN"
+install -m 755 "$SRC_DIR/proxdump" "$BIN"
 install -d -m 700 "$CONF_DIR"
 
 echo
-echo "onedrivepbs $("$BIN" --version) installed in $BIN ($(rclone version | head -n1))."
-echo "Run 'onedrivepbs' then open the Configuration menu."
+echo "proxdump $("$BIN" --version) installed in $BIN ($(rclone version | head -n1))."
+echo "Run 'proxdump' then open the Configuration menu."
