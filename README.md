@@ -9,21 +9,9 @@ to **Microsoft OneDrive**, **Google Drive**, **Dropbox**, any
 MinIO…) or an **SFTP server**. Everything is driven from menus in the
 terminal; nothing has to be learnt about `rclone`.
 
-```
- PROXDUMP 1.0.0                                                          pve
+![proxdump demo: backup of a container to OneDrive, restore under a new ID, configuration and appearance menus](docs/demo.gif)
 
-   ╭─ Backup ─────────────────────────────────────────────────────────────╮
-   │                                                                      │
-   │ Backup 1 of 2: qemu 100 (web)                                        │
-   │                                                                      │
-   │ ⠹ Encrypted upload of vzdump-qemu-100-….vma.zst (2.5GB) to OneDrive… │
-   │   1.5GB / 2.5GB  40MB/s  remaining: 24s                              │
-   │                                                                      │
-   │ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  61%  │
-   ╰──────────────────────────────────────────────────────── 1m12s ───────╯
-
- Ctrl-C Interrupt
-```
+*Recorded on a real node; the long transfers are sped up.*
 
 ## Highlights
 
@@ -54,11 +42,11 @@ terminal; nothing has to be learnt about `rclone`.
 ## How it works
 
 ```
- guest (VM/CT)                 local staging folder             destination(s)
-┌─────────────┐   vzdump     ┌─────────────────────────┐  rclone  ┌──────────────────────┐
-│ 100 web     │ ───────────▶ │ vzdump-qemu-100-….vma.zst│ ──────▶ │ pve-backups/<node>/  │
-└─────────────┘              │ (plaintext, deleted after)│  crypt │  ….vma.zst.encrypted │
-                             └─────────────────────────┘          └──────────────────────┘
+ guest (VM/CT)                  local staging folder                      destination(s)
+┌─────────────┐   vzdump    ┌───────────────────────────┐   rclone   ┌──────────────────────┐
+│ 100 web     │ ──────────> │ vzdump-qemu-100-….vma.zst │ ─────────> │ pve-backups/<node>/  │
+└─────────────┘             │ plaintext, then deleted   │   crypt    │ ….vma.zst.encrypted  │
+                            └───────────────────────────┘            └──────────────────────┘
 ```
 
 For each guest: `vzdump` creates the archive in a temporary folder, `rclone`
@@ -97,6 +85,10 @@ cd proxdump
 To update: `git pull && ./install.sh`. To remove: `./install.sh --uninstall`
 (the configuration is kept).
 
+On a node without git, download the `.deb` package from the
+[releases](https://github.com/Mrdindon/proxdump/releases) and install it with
+`apt install ./proxdump_*.deb`.
+
 ## Getting started
 
 Run `proxdump` as root, then in **Configuration**:
@@ -127,6 +119,8 @@ The detailed documentation is in English:
   Drive, Dropbox, S3, SFTP, lifetime of the access tokens;
 - [Using proxdump](docs/USAGE.md) — language and appearance, encryption,
   backup, management, restore, scheduling and command line;
+- [Encryption](docs/ENCRYPTION.md) — algorithms, what stays visible on the
+  destination, where the secrets are kept;
 - [Disaster recovery](docs/RECOVERY.md) — restoring on a new server, with or
   without this tool;
 - [Reference](docs/REFERENCE.md) — files and security, troubleshooting,
@@ -144,4 +138,4 @@ The detailed documentation is in English:
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[AGPL-3.0-or-later](LICENSE).

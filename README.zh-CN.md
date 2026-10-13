@@ -7,21 +7,9 @@
 任何 **S3 兼容存储**（Backblaze B2、Cloudflare R2、Wasabi、Amazon S3、MinIO 等）
 或 **SFTP 服务器**。所有操作都通过终端中的菜单完成，无需了解 `rclone`。
 
-```
- PROXDUMP 1.0.0                                                          pve
+![proxdump 演示：将容器备份到 OneDrive、以新 ID 恢复、配置和外观菜单](docs/demo.gif)
 
-   ╭─ 备份 ───────────────────────────────────────────────────────────────╮
-   │                                                                      │
-   │ 备份 1/2：qemu 100（web）                                            │
-   │                                                                      │
-   │ ⠹ 正在将 vzdump-qemu-100-….vma.zst（2.5GB）加密上传到 OneDrive…      │
-   │   1.5GB / 2.5GB  40MB/s  剩余：24s                                   │
-   │                                                                      │
-   │ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  61%  │
-   ╰──────────────────────────────────────────────────────── 1m12s ───────╯
-
- Ctrl-C 中断
-```
+*在真实节点上录制；较长的传输过程已加速。演示界面为英文。*
 
 ## 主要特点
 
@@ -44,11 +32,11 @@
 ## 工作原理
 
 ```
- 客户机 (VM/CT)                  本地暂存目录                        目标
-┌─────────────┐   vzdump     ┌─────────────────────────┐  rclone  ┌──────────────────────┐
-│ 100 web     │ ───────────▶ │ vzdump-qemu-100-….vma.zst│ ──────▶ │ pve-backups/<节点>/  │
-└─────────────┘              │ （明文，上传后删除）      │  crypt │  ….vma.zst.encrypted │
-                             └─────────────────────────┘          └──────────────────────┘
+客户机 (VM/CT)                      本地暂存目录                               目标
+┌─────────────┐   vzdump    ┌───────────────────────────┐   rclone   ┌──────────────────────┐
+│ 100 web     │ ──────────> │ vzdump-qemu-100-….vma.zst │ ─────────> │ pve-backups/<node>/  │
+└─────────────┘             │ 明文，上传后删除          │   crypt    │ ….vma.zst.encrypted  │
+                            └───────────────────────────┘            └──────────────────────┘
 ```
 
 对每个客户机：`vzdump` 在临时目录中创建归档，`rclone` 将其加密并上传，校验副本，
@@ -85,6 +73,9 @@ cd proxdump
 `curl`），并把工具复制到 `/usr/local/bin/proxdump`。更新：
 `git pull && ./install.sh`。卸载：`./install.sh --uninstall`（保留配置）。
 
+节点上没有 git 时，可从 [Releases](https://github.com/Mrdindon/proxdump/releases)
+下载 `.deb` 软件包，然后用 `apt install ./proxdump_*.deb` 安装。
+
 ## 快速开始
 
 以 root 身份运行 `proxdump`，然后在**配置**中：
@@ -113,6 +104,7 @@ proxdump prune                            # 应用保留策略
   Dropbox、S3、SFTP，访问令牌的有效期；
 - [Using proxdump](docs/USAGE.md) — 语言和外观、加密、备份、管理、恢复、计划任务
   和命令行；
+- [Encryption](docs/ENCRYPTION.md) — 算法、目标端可见的信息、密钥和口令的存放位置；
 - [Disaster recovery](docs/RECOVERY.md) — 在新服务器上恢复（使用或不使用本工具）；
 - [Reference](docs/REFERENCE.md) — 文件与安全、故障排除、已知限制；
 - [Development](docs/DEVELOPMENT.md) — 不使用真实账户进行测试、翻译。
@@ -126,4 +118,4 @@ proxdump prune                            # 应用保留策略
 
 ## 许可证
 
-MIT — 参见 [LICENSE](LICENSE)。
+[AGPL-3.0-or-later](LICENSE)。

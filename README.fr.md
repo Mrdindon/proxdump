@@ -9,21 +9,9 @@ envoie vers **Microsoft OneDrive**, **Google Drive**, **Dropbox**, tout
 MinIO…) ou un **serveur SFTP**. Tout se pilote par des menus dans le
 terminal ; il n'y a rien à apprendre de `rclone`.
 
-```
- PROXDUMP 1.0.0                                                          pve
+![Démonstration de proxdump : sauvegarde d'un conteneur vers OneDrive, restauration sous un nouvel ID, menus de configuration et d'apparence](docs/demo.gif)
 
-   ╭─ Sauvegarde ─────────────────────────────────────────────────────────╮
-   │                                                                      │
-   │ Sauvegarde 1 sur 2 : qemu 100 (web)                                  │
-   │                                                                      │
-   │ ⠹ Envoi chiffré de vzdump-qemu-100-….vma.zst (2.5GB) vers OneDrive…  │
-   │   1.5GB / 2.5GB  40MB/s  restant : 24s                               │
-   │                                                                      │
-   │ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  61%  │
-   ╰──────────────────────────────────────────────────────── 1m12s ───────╯
-
- Ctrl-C Interrompre
-```
+*Enregistré sur un vrai nœud ; les longs transferts sont accélérés. Interface montrée en anglais.*
 
 ## Points forts
 
@@ -55,11 +43,11 @@ terminal ; il n'y a rien à apprendre de `rclone`.
 ## Fonctionnement
 
 ```
- invité (VM/CT)               dossier de transit local           destination(s)
-┌─────────────┐   vzdump     ┌─────────────────────────┐  rclone  ┌──────────────────────┐
-│ 100 web     │ ───────────▶ │ vzdump-qemu-100-….vma.zst│ ──────▶ │ pve-backups/<nœud>/  │
-└─────────────┘              │ (en clair, supprimé après)│  crypt │  ….vma.zst.encrypted │
-                             └─────────────────────────┘          └──────────────────────┘
+invité (VM/CT)                dossier de transit local                    destination(s)
+┌─────────────┐   vzdump    ┌───────────────────────────┐   rclone   ┌──────────────────────┐
+│ 100 web     │ ──────────> │ vzdump-qemu-100-….vma.zst │ ─────────> │ pve-backups/<node>/  │
+└─────────────┘             │ en clair, puis supprimé   │   crypt    │ ….vma.zst.encrypted  │
+                            └───────────────────────────┘            └──────────────────────┘
 ```
 
 Pour chaque invité : `vzdump` crée l'archive dans un dossier temporaire,
@@ -100,6 +88,10 @@ cd proxdump
 Pour mettre à jour : `git pull && ./install.sh`. Pour désinstaller :
 `./install.sh --uninstall` (la configuration est conservée).
 
+Sur un nœud sans git, téléchargez le paquet `.deb` depuis les
+[versions publiées](https://github.com/Mrdindon/proxdump/releases) et installez-le
+avec `apt install ./proxdump_*.deb`.
+
 ## Premiers pas
 
 Lancez `proxdump` en root, puis dans **Configuration** :
@@ -130,6 +122,8 @@ La documentation détaillée est en anglais :
   Drive, Dropbox, S3, SFTP, durée de vie des jetons d'accès ;
 - [Using proxdump](docs/USAGE.md) — langue et apparence, chiffrement,
   sauvegarde, gestion, restauration, planification et ligne de commande ;
+- [Encryption](docs/ENCRYPTION.md) — algorithmes, ce qui reste visible sur
+  la destination, où sont conservés les secrets ;
 - [Disaster recovery](docs/RECOVERY.md) — restaurer sur un nouveau serveur,
   avec ou sans cet outil ;
 - [Reference](docs/REFERENCE.md) — fichiers et sécurité, dépannage, limites
@@ -148,4 +142,4 @@ La documentation détaillée est en anglais :
 
 ## Licence
 
-MIT — voir [LICENSE](LICENSE).
+[AGPL-3.0-or-later](LICENSE).

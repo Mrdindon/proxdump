@@ -2,6 +2,43 @@
 
 [← proxdump](../README.md)
 
+## How it works
+
+For each selected guest:
+
+1. `vzdump` creates the archive (and its log) in a temporary subfolder;
+2. `rclone` uploads it through a `crypt` *remote*: the file is encrypted
+   locally (XSalsa20-Poly1305, key derived from the passphrase with scrypt),
+   so the destination only receives unreadable data;
+3. `rclone cryptcheck` compares the local and remote checksums;
+4. retention is applied to that guest (the oldest versions beyond the
+   configured number are deleted);
+5. steps 2 to 4 are repeated for each destination selected, then the
+   temporary subfolder is deleted.
+
+OneDrive shows this:
+
+```
+pve-backups/<node>/
+├── 100_web/
+│   ├── vzdump-qemu-100-2026_10_12-02_00_03.vma.zst.encrypted
+│   └── vzdump-qemu-100-2026_10_12-02_00_03.log.encrypted
+└── 101_dns/
+    ├── vzdump-lxc-101-2026_10_12-02_04_41.tar.zst.encrypted
+    └── vzdump-lxc-101-2026_10_12-02_04_41.log.encrypted
+```
+
+`vzdump` itself decides what goes into an archive, so Proxmox's per-disk
+backup setting is honoured: a VM disk with "Backup" unticked (`backup=0`) is
+left out, and a container mount point is only included if it has `backup=1`
+(the root disk always is). Disks left out are not in the archive and are
+therefore not restored.
+
+The archives are standard `vzdump` archives: once downloaded and decrypted,
+they can also be restored with `qmrestore` / `pct restore` or the Proxmox web
+interface, without this tool.
+
+
 ## Language
 
 The interface and the log follow the language of the system (`LANG`) when it
@@ -49,10 +86,13 @@ A single passphrase protects every destination.
 
 > **Write this passphrase down off the server** (password manager, paper).
 > It is required to restore if this server is lost. Without it, the backups
-> are permanently unreadable — nobody, not even Microsoft, can decrypt them.
+> are permanently unreadable — nobody, not even the storage provider, can decrypt them.
 
 The same menu lets you display the passphrase again later, or change it.
 Note: existing backups remain encrypted with the old passphrase.
+
+The algorithms, what stays visible on the destination and where the secrets
+are kept are described in [Encryption](ENCRYPTION.md).
 
 ### File names
 
@@ -164,13 +204,13 @@ turn (up to 12 hours).
 Subcommands you can use in your own scripts:
 
 ```
-proxdump backup --all       # every guest on the node
-proxdump backup 100 101     # specific guests
-proxdump backup --to gdrive --all            # one destination only
-proxdump backup --to onedrive,gdrive 100     # several destinations
-proxdump list               # stored backups
-proxdump prune              # apply retention
-proxdump keepalive          # renew the tokens that can lapse (see CONNECTIONS.md)
+proxdump backup --all                      # every guest on the node
+proxdump backup 100 101                    # specific guests
+proxdump backup --to gdrive --all          # one destination only
+proxdump backup --to onedrive,gdrive 100   # several destinations
+proxdump list                              # stored backups
+proxdump prune                             # apply retention
+proxdump keepalive                         # renew the tokens that can lapse
 ```
 
 Destinations are named `onedrive`, `gdrive`, `dropbox`, `s3` and `sftp`.

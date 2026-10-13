@@ -10,21 +10,9 @@ Cloudflare R2, Wasabi, Amazon S3, MinIO…) oder einem **SFTP-Server** hoch.
 Alles wird über Menüs im Terminal gesteuert; `rclone` muss man dafür nicht
 kennen.
 
-```
- PROXDUMP 1.0.0                                                          pve
+![proxdump-Demo: Sicherung eines Containers nach OneDrive, Wiederherstellung unter einer neuen ID, Konfigurations- und Erscheinungsbild-Menüs](docs/demo.gif)
 
-   ╭─ Sicherung ──────────────────────────────────────────────────────────╮
-   │                                                                      │
-   │ Sicherung 1 von 2: qemu 100 (web)                                    │
-   │                                                                      │
-   │ ⠹ Verschlüsselter Upload von vzdump-qemu-100-….vma.zst nach OneDrive…│
-   │   1.5GB / 2.5GB  40MB/s  verbleibend: 24s                            │
-   │                                                                      │
-   │ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  61%  │
-   ╰──────────────────────────────────────────────────────── 1m12s ───────╯
-
- Ctrl-C Abbrechen
-```
+*Auf einem echten Knoten aufgenommen; die langen Übertragungen sind beschleunigt. Oberfläche auf Englisch gezeigt.*
 
 ## Merkmale
 
@@ -57,11 +45,11 @@ kennen.
 ## Funktionsweise
 
 ```
- Gast (VM/CT)                  lokaler Zwischenordner               Ziel(e)
-┌─────────────┐   vzdump     ┌─────────────────────────┐  rclone  ┌──────────────────────┐
-│ 100 web     │ ───────────▶ │ vzdump-qemu-100-….vma.zst│ ──────▶ │ pve-backups/<Knoten>/│
-└─────────────┘              │ (Klartext, danach gelöscht)│ crypt │  ….vma.zst.encrypted │
-                             └─────────────────────────┘          └──────────────────────┘
+ Gast (VM/CT)                  lokaler Zwischenordner                        Ziel(e)
+┌─────────────┐   vzdump    ┌───────────────────────────┐   rclone   ┌──────────────────────┐
+│ 100 web     │ ──────────> │ vzdump-qemu-100-….vma.zst │ ─────────> │ pve-backups/<node>/  │
+└─────────────┘             │ Klartext, dann gelöscht   │   crypt    │ ….vma.zst.encrypted  │
+                            └───────────────────────────┘            └──────────────────────┘
 ```
 
 Für jeden Gast: `vzdump` erstellt das Archiv in einem temporären Ordner,
@@ -102,6 +90,10 @@ cd proxdump
 `/usr/local/bin/proxdump`. Aktualisieren: `git pull && ./install.sh`.
 Entfernen: `./install.sh --uninstall` (die Konfiguration bleibt erhalten).
 
+Auf einem Knoten ohne git: das `.deb`-Paket von den
+[Releases](https://github.com/Mrdindon/proxdump/releases) herunterladen und mit
+`apt install ./proxdump_*.deb` installieren.
+
 ## Erste Schritte
 
 `proxdump` als root starten, dann unter **Konfiguration**:
@@ -133,6 +125,8 @@ Die ausführliche Dokumentation ist auf Englisch:
 - [Using proxdump](docs/USAGE.md) — Sprache und Erscheinungsbild,
   Verschlüsselung, Sicherung, Verwaltung, Wiederherstellung, Zeitplanung und
   Kommandozeile;
+- [Encryption](docs/ENCRYPTION.md) — Algorithmen, was am Ziel sichtbar
+  bleibt, wo die Geheimnisse liegen;
 - [Disaster recovery](docs/RECOVERY.md) — Wiederherstellung auf einem neuen
   Server, mit oder ohne dieses Werkzeug;
 - [Reference](docs/REFERENCE.md) — Dateien und Sicherheit, Fehlerbehebung,
@@ -152,4 +146,4 @@ Die ausführliche Dokumentation ist auf Englisch:
 
 ## Lizenz
 
-MIT — siehe [LICENSE](LICENSE).
+[AGPL-3.0-or-later](LICENSE).
