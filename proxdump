@@ -29,7 +29,7 @@ COMPRESS="zstd"                   # zstd | gzip | lzo | 0
 BWLIMIT=""                        # rclone rate limit (e.g. 10M), empty = none
 VERIFY=1                          # verify checksums after upload
 UI_LANG=""                        # interface language; empty = that of the system
-UI_STYLE="whiptail"               # whiptail | native (dialogs drawn by proxdump)
+UI_STYLE="native"                 # native (dialogs drawn by proxdump) | whiptail
 UI_THEME="auto"                   # colours of the native interface
 UI_MOUSE=1                        # mouse in the native interface
 declare -A KEEP_BY_ID=()          # per-guest retention: KEEP_BY_ID[100]=5
