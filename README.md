@@ -118,12 +118,15 @@ donc depuis un autre ordinateur, une seule fois.
 3. Le navigateur s'ouvre : connectez-vous au compte Microsoft et acceptez
    l'accès demandé par rclone.
 4. rclone affiche un long bloc de texte entre `--->` et `<---End paste`.
-   Copiez-le (sans les flèches) et collez-le dans l'assistant, sur une seule
-   ligne. Si le collage pose problème, enregistrez ce bloc dans un fichier sur
-   le serveur et donnez le chemin du fichier à la place.
+   Copiez-le et collez-le dans l'assistant : les coupures de ligne ajoutées
+   par le terminal et les flèches copiées par mégarde sont ignorées, et un
+   jeton incomplet est redemandé. Si le collage pose problème, enregistrez ce
+   bloc dans un fichier sur le serveur et donnez le chemin du fichier à la
+   place.
 5. L'assistant pose ensuite les questions de rclone : type de compte
-   (choisissez `onedrive` pour un compte personnel ou professionnel), lecteur à
-   utiliser, puis confirmation.
+   (choisissez `onedrive` pour un compte personnel ou professionnel), puis
+   confirmation du lecteur. Les lecteurs techniques de Microsoft sont
+   écartés ; le choix n'est proposé que s'il reste plusieurs lecteurs.
 6. Un test de connexion affiche l'espace total et libre du compte.
 
 Le jeton obtenu est enregistré dans `/etc/onedrivepbs/rclone.conf` ; rclone le

@@ -573,6 +573,61 @@ ui_restore() {
 
 # --- Configuration -----------------------------------------------------------
 
+# Nettoie un jeton collé : retours à la ligne et espaces ajoutés par le
+# terminal, flèches « ---> » et « <---End paste » copiées par mégarde
+clean_token() {
+    local t
+    t=$(tr -d '[:space:]' <<<"$1")
+    [[ $t == *'--->'* ]] && t=${t##*--->}
+    t=${t%%<---*}
+    printf '%s' "$t"
+}
+
+# Vrai si le jeton est complet (JSON rclone, ou sa variante encodée en base64)
+token_ok() {
+    jq -e '.access_token | strings | length > 0' <<<"$1" >/dev/null 2>&1 ||
+        base64 -d <<<"$1" 2>/dev/null | jq -e 'type == "object"' >/dev/null 2>&1
+}
+
+# Lit le jeton au clavier ; un collage coupé en plusieurs lignes est recollé
+read_token() {
+    local buf="" line prompt="Jeton > "
+    while read -e -r -p "$prompt" line; do
+        if [[ -z $buf && -n $line && -f $line ]]; then
+            buf=$(<"$line")
+            break
+        fi
+        [[ -z $line ]] && break
+        buf+=$line
+        token_ok "$(clean_token "$buf")" && break
+        prompt="  (suite, ou Entrée pour terminer) > "
+    done
+    # restes éventuels du collage (« <---End paste »…)
+    while read -r -s -t 0.3 line; do :; done
+    clean_token "$buf"
+}
+
+# Choix du lecteur : rclone liste aussi des lecteurs techniques de Microsoft
+# (archives de métadonnées, « bundles », identifiants bruts) sans intérêt ici.
+# S'il ne reste qu'un vrai lecteur, il est retenu d'office.
+pick_drive() { # réponse JSON de rclone
+    local out=$1 n i name items=() real=()
+    local junk='^(ODCMetadataArchive|Bundles_[0-9a-f]+|[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}) '
+    n=$(jq -r '.Option.Examples | length' <<<"$out")
+    for ((i = 0; i < n; i++)); do
+        name=$(jq -r ".Option.Examples[$i].Help" <<<"$out" | head -n1 | cut -c1-70)
+        items+=("$i" "$name")
+        [[ $name =~ $junk ]] || real+=("$i" "$name")
+    done
+    if ((${#real[@]} == 2)); then
+        i=${real[0]}
+    else
+        ((${#real[@]} > 2)) && items=("${real[@]}")
+        i=$(menu "Lecteur OneDrive à utiliser" "${items[@]}") || return 1
+    fi
+    jq -r ".Option.Examples[$i].Value" <<<"$out"
+}
+
 # Pilote l'assistant de configuration rclone question par question
 onedrive_wizard() {
     local out err bak state qname help def result n i items token
@@ -611,14 +666,22 @@ Autorisation OneDrive (ce serveur n'a pas de navigateur)
 
 2. Connectez-vous à votre compte Microsoft dans la page qui s'ouvre et acceptez.
 3. rclone affiche alors un bloc de texte entre « ---> » et « <---End paste ».
-   Copiez ce bloc (sans les flèches) et collez-le ci-dessous, sur une seule ligne.
+   Copiez ce bloc et collez-le ci-dessous (les coupures de ligne sont tolérées).
    Vous pouvez aussi indiquer le chemin d'un fichier contenant ce bloc.
 
 EOF
-            read -e -r -p "Jeton > " token || { wizard_abort; return 1; }
-            [[ -f $token ]] && token=$(tr -d '\n' <"$token")
-            [[ -n $token ]] || { wizard_abort; return 1; }
+            while :; do
+                token=$(read_token)
+                [[ -n $token ]] || { wizard_abort; return 1; }
+                token_ok "$token" && break
+                echo
+                echo "Jeton incomplet ou invalide (${#token} caractères reçus) : il doit commencer par"
+                echo "« { » et finir par « } ». Recollez-le en entier, ou Entrée seule pour abandonner."
+                echo
+            done
             result=$token
+        elif [[ $qname == config_driveid ]] && ((n > 0)); then
+            result=$(pick_drive "$out") || { wizard_abort; return 1; }
         elif ((n > 0)); then
             items=()
             for ((i = 0; i < n; i++)); do
