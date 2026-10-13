@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # proxdump — encrypted backup of Proxmox VE VMs/containers to cloud storage
-# (Microsoft OneDrive, Google Drive)
+# (Microsoft OneDrive, Google Drive, Dropbox, S3-compatible storage, SFTP)
 #
 # Pipeline: vzdump (temporary local archive) -> rclone crypt -> destination(s)
 # Interface: whiptail menus, or non-interactive subcommands (cron).
@@ -31,14 +31,23 @@ VERIFY=1                          # verify checksums after upload
 declare -A KEEP_BY_ID=()          # per-guest retention: KEEP_BY_ID[100]=5
 
 CLEANUP_DIRS=()
+UI=0 # 1 while an operation started from the menus runs behind a gauge
 
 # --- Destinations ------------------------------------------------------------
 # A destination is an rclone remote named after its id, with a "crypt" remote
 # '<id>-crypt' layered on top. Supporting another repository starts here.
-DEST_IDS=(onedrive gdrive)
-declare -A DEST_NAMES=([onedrive]="OneDrive" [gdrive]="Google Drive")
-declare -A DEST_TYPES=([onedrive]=onedrive [gdrive]=drive) # rclone backend
-declare -A DEST_VENDORS=([onedrive]=Microsoft [gdrive]=Google)
+DEST_IDS=(onedrive gdrive dropbox s3 sftp)
+declare -A DEST_NAMES=([onedrive]="OneDrive" [gdrive]="Google Drive"
+    [dropbox]="Dropbox" [s3]="S3 storage" [sftp]="SFTP server")
+declare -A DEST_TYPES=([onedrive]=onedrive [gdrive]=drive
+    [dropbox]=dropbox [s3]=s3 [sftp]=sftp) # rclone backend
+# destinations authorized in a web browser, and who grants the authorization
+declare -A DEST_VENDORS=([onedrive]=Microsoft [gdrive]=Google [dropbox]=Dropbox)
+# destinations whose token lapses when it stays unused, and after how long
+declare -A DEST_TOKEN_LIFE=([onedrive]="90 days" [gdrive]="6 months")
+# where REMOTE_DIR lives on destinations that have no root of their own:
+# the bucket (s3) or a folder of the server (sftp). Saved in $CONF_FILE.
+declare -A DEST_ROOT=()
 DESTS=() # destinations of the backup being run
 
 # Makes a destination the current one: every function below that reads,
@@ -51,6 +60,13 @@ use_dest() {
 }
 use_dest onedrive
 
+# 'remote:path' of the folder that holds the backups of a destination
+dest_base() { # id
+    local root=${DEST_ROOT[$1]:-}
+    [[ -n $root ]] && root="${root%/}/"
+    echo "$1:$root$REMOTE_DIR"
+}
+
 # --- Helpers -----------------------------------------------------------------
 
 log() {
@@ -58,6 +74,9 @@ log() {
     line="$(date '+%F %T') $*"
     echo "$line" >>"$LOG_FILE" 2>/dev/null
     echo "$*"
+    # from the menus, each message also becomes the step shown in the gauge
+    ((UI)) && [[ $* != ERROR* ]] && gauge_step "$*"
+    return 0
 }
 
 die() {
@@ -72,7 +91,7 @@ cleanup() {
     done
 }
 trap cleanup EXIT
-trap 'echo; log "Interrupted."; exit 130' INT TERM
+trap 'ui_abort; echo; log "Interrupted."; exit 130' INT TERM
 
 load_config() {
     # shellcheck disable=SC1090
@@ -93,6 +112,9 @@ save_config() {
         done
         for id in "${!KEEP_BY_ID[@]}"; do
             printf 'KEEP_BY_ID[%s]=%q\n' "$id" "${KEEP_BY_ID[$id]}"
+        done
+        for id in "${!DEST_ROOT[@]}"; do
+            printf 'DEST_ROOT[%s]=%q\n' "$id" "${DEST_ROOT[$id]}"
         done
     } >"$CONF_FILE.tmp"
     chmod 600 "$CONF_FILE.tmp"
@@ -141,6 +163,9 @@ dest_list() {
         grep -qxF "$id:" <<<"$remotes" && grep -qxF "$id-crypt:" <<<"$remotes" &&
             printf '%s\t%s\n' "$id" "${DEST_NAMES[$id]}"
     done
+    # the status of the last test must not become that of the function:
+    # callers read it through pipelines, under 'pipefail'
+    return 0
 }
 
 dest_ready() { # id
@@ -200,11 +225,28 @@ human_duration() { # seconds -> 1h02m, 3m04s, 5s
     fi
 }
 
+# While an operation runs from the menus, its progress is shown by a whiptail
+# gauge fed through fd 8: a heading (G_HEAD), the current step (G_STEP) and
+# a line of details.
+gauge() { # percentage, details
+    local w=$((W - 4))
+    printf 'XXX\n%s\n%s\n\n%s\n%s\nXXX\n' "$1" "${G_HEAD:0:w}" "${G_STEP:0:w}" "${2:0:w}" 2>/dev/null >&8
+}
+gauge_step() {
+    G_STEP=${1#=== }
+    G_STEP=${G_STEP% ===}
+    gauge 0 ""
+}
+
 # Redraws a one-line progress bar in place: [#####-----]  42%  details
 progress_bar() { # percentage, details
     local pct=$1 cols width fill line
-    cols=$(tput cols 2>/dev/null || echo 80)
     ((pct > 100)) && pct=100
+    if ((UI)); then
+        gauge "$pct" "$2"
+        return
+    fi
+    cols=$(tput cols 2>/dev/null || echo 80)
     width=$((cols - 60)); ((width > 40)) && width=40; ((width < 10)) && width=10
     fill=$((pct * width / 100))
     printf -v line '[%s%s] %3d%%  %s' "$(printf '%*s' "$fill" '' | tr ' ' '#')" \
@@ -213,18 +255,37 @@ progress_bar() { # percentage, details
 }
 
 # Same line, for steps that report no percentage
-progress_note() { printf '\r\033[K%s' "$1"; }
-progress_end() { printf '\r\033[K'; }
+progress_note() {
+    if ((UI)); then gauge 0 "$1"; else printf '\r\033[K  %s' "$1"; fi
+}
+progress_end() { ((UI)) || printf '\r\033[K'; }
+
+# Runs a command that reports nothing while it works; behind a gauge, the
+# time elapsed is shown meanwhile.
+run_quiet() { # command…
+    local pid start=$SECONDS
+    if ((!UI)); then
+        "$@"
+        return
+    fi
+    "$@" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        gauge 0 "$(human_duration $((SECONDS - start))) elapsed"
+        sleep 1
+    done
+    wait "$pid"
+}
 
 # Runs a Proxmox command (vzdump, qmrestore, pct restore) and logs its output.
 # On a terminal, its percentage lines become a progress bar; while it reports
 # none (container archives), the size written so far to the given folder is shown.
 run_logged() { # folder to watch (or ""), command…
-    local dir=$1 line part="" rc bar=0 start=$SECONDS
+    local dir=$1 line part="" rc bar=0 pct=0 start=$SECONDS
     local re_dump='^INFO: +([0-9]+)% \(([^)]*)\) in ([^,]*)(, read: ([^,]*))?'
     local re_restore='^progress ([0-9]+)% \(read ([0-9]+) bytes, duration ([0-9]+) sec\)'
     shift
-    if [[ ! -t 1 ]]; then
+    if ((!UI)) && [[ ! -t 1 ]]; then
         "$@" 2>&1 | tee -a "$LOG_FILE"
         return "${PIPESTATUS[0]}"
     fi
@@ -234,7 +295,7 @@ run_logged() { # folder to watch (or ""), command…
         if ((rc > 128)); then # nothing new for 2 s
             part+=$line
             if ((!bar)) && [[ -n $dir ]]; then
-                progress_note "  In progress: $(human_size "$(du -sb "$dir" 2>/dev/null | cut -f1)") written, $(human_duration $((SECONDS - start))) elapsed"
+                progress_note "In progress: $(human_size "$(du -sb "$dir" 2>/dev/null | cut -f1)") written, $(human_duration $((SECONDS - start))) elapsed"
             fi
             continue
         fi
@@ -243,15 +304,21 @@ run_logged() { # folder to watch (or ""), command…
         ((rc != 0)) && [[ -z $line ]] && break
         echo "$line" >>"$LOG_FILE"
         if [[ $line =~ $re_dump ]]; then
-            bar=1
+            bar=1 pct=${BASH_REMATCH[1]}
             progress_bar "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}  ${BASH_REMATCH[5]}  ${BASH_REMATCH[3]}"
         elif [[ $line =~ $re_restore ]]; then
-            bar=1
+            bar=1 pct=${BASH_REMATCH[1]}
             progress_bar "${BASH_REMATCH[1]}" "$(human_size "${BASH_REMATCH[2]}") read  $(human_duration "${BASH_REMATCH[3]}")"
         else
             bar=0
-            progress_end
-            echo "$line"
+            if ((UI)); then
+                # the full output is in the log; errors also go to the summary
+                gauge "$pct" "${line#INFO: }"
+                [[ $line == *ERROR* || $line == *rror:* ]] && echo "$line"
+            else
+                progress_end
+                echo "$line"
+            fi
         fi
         ((rc != 0)) && break
     done
@@ -266,7 +333,7 @@ run_logged() { # folder to watch (or ""), command…
 rclone_copy() { # source, destination
     local opts=(--retries 5 --low-level-retries 20) kind a b c d rc
     [[ -n $BWLIMIT ]] && opts+=(--bwlimit "$BWLIMIT")
-    if [[ ! -t 1 ]]; then
+    if ((!UI)) && [[ ! -t 1 ]]; then
         rclone copy "$1" "$2" "${opts[@]}" --log-file "$LOG_FILE" --log-level INFO \
             --stats 5m --stats-one-line
         return
@@ -381,10 +448,24 @@ prune_remote() {
         fi
     done < <(remote_list)
     ((deleted > 0)) && rclone rmdirs "$CRYPT_REMOTE:" --leave-root 2>>"$LOG_FILE"
-    log "Retention: $deleted backup(s) deleted."
+    # after a backup, only worth a line when something was deleted
+    [[ -n $only ]] && ((deleted == 0)) || log "Retention: $deleted backup(s) deleted."
 }
 
 # --- Backup ------------------------------------------------------------------
+
+# Compares an uploaded folder with its local source. Checksums are used
+# whenever the destination provides them; an SFTP server without checksum
+# commands only allows the sizes to be compared.
+verify_upload() { # local folder, crypt path
+    if rclone backend features "$BASE_REMOTE:" 2>/dev/null | jq -e '.Hashes | length > 0' >/dev/null; then
+        log "Verifying checksums (re-reads the local archive)…"
+        run_quiet rclone cryptcheck "$1" "$2" --one-way --log-file "$LOG_FILE" --log-level NOTICE
+    else
+        log "Verifying sizes ($DEST_NAME provides no checksums)…"
+        run_quiet rclone check "$1" "$2" --one-way --size-only --log-file "$LOG_FILE" --log-level NOTICE
+    fi
+}
 
 backup_guest() { # vmid type name
     local id=$1 type=$2 name=$3 tmp archive safe dest rc d
@@ -400,6 +481,7 @@ backup_guest() { # vmid type name
     chmod 711 "$tmp"
 
     log "=== Backing up $type $id ($name) ==="
+    ((UI)) && gauge_step "Creating the archive (vzdump, $VZDUMP_MODE mode)…"
     run_logged "$tmp" vzdump "$id" --dumpdir "$tmp" --mode "$VZDUMP_MODE" --compress "$COMPRESS"
     rc=$?
     archive=$(find "$tmp" -maxdepth 1 -type f \( -name 'vzdump-*.vma*' -o -name 'vzdump-*.tar*' \) | head -n1)
@@ -419,9 +501,7 @@ backup_guest() { # vmid type name
             continue
         fi
         if [[ $VERIFY == 1 ]]; then
-            log "Verifying checksums (re-reads the local archive, no progress shown)…"
-            if ! rclone cryptcheck "$tmp" "$CRYPT_REMOTE:$dest" --one-way \
-                --log-file "$LOG_FILE" --log-level NOTICE; then
+            if ! verify_upload "$tmp" "$CRYPT_REMOTE:$dest"; then
                 log "ERROR: verification failed for $id — the copy on $DEST_NAME cannot be trusted"
                 rc=1
                 continue
@@ -437,7 +517,7 @@ backup_guest() { # vmid type name
 # Backs up a list of guests to the destinations in DESTS;
 # exit status = number of failures
 backup_guests() { # vmid…
-    local id type name status failed=0 found guests
+    local id type name status failed=0 found guests n=0
     ((${#DESTS[@]})) || { log "ERROR: no destination is configured"; return 1; }
     for id in "${DESTS[@]}"; do
         dest_ready "$id" || { log "ERROR: destination '$id' is not configured"; return 1; }
@@ -449,6 +529,8 @@ backup_guests() { # vmid…
         while IFS=$'\t' read -r gid type name status; do
             if [[ $gid == "$id" ]]; then
                 found=1
+                n=$((n + 1))
+                G_HEAD="Backup $n of $#: $type $id ($name)"
                 backup_guest "$id" "$type" "$name" </dev/null || failed=$((failed + 1))
                 break
             fi
@@ -525,20 +607,71 @@ checklist() { # text, then tag/label/state triplets
     whiptail --title "$TITLE" --separate-output --checklist "$text" "$H" "$W" "$LH" "$@" 3>&1 1>&2 2>&3
 }
 
-# Between two dialogs the terminal shows whatever was printed last. These two
-# keep it clean: nothing from a previous operation is ever left behind.
-screen() { # heading of the operation about to run
+# Runs an operation behind a gauge, then displays what it reported. The
+# operation runs in this shell, its messages going to the summary.
+ui_run() { # heading, command…
+    local heading=$1 out rc start=$SECONDS
+    shift
+    out=$(mktemp)
+    dims
+    G_HEAD=$heading
+    G_STEP=""
+    # the gauge keeps the height of its first text: four lines
+    exec 8> >(exec whiptail --title "$TITLE" --gauge "$heading"$'\n \n \n ' 11 "$W" 0)
+    GAUGE_PID=$!
+    # whiptail switches the terminal to raw mode, in which Ctrl-C is an
+    # ordinary key: once it has started, interruptions are enabled again
+    sleep 0.3
+    stty isig intr '^C' 2>/dev/null
+    UI=1
+    "$@" >"$out" 2>&1
+    rc=$?
+    UI=0
+    exec 8>&-
+    wait "$GAUGE_PID" 2>/dev/null
+    # the summary: the outcome first, then what was done and what failed,
+    # without the steps (lines ending in '…') nor rclone's retries
+    {
+        grep '^Done:' "$out" | tail -n 1
+        echo
+        grep -vE '^Done:|…$|^=== |^rclone: Attempt |^$' "$out" | awk '!seen[$0]++'
+        printf '\nDuration: %s. The details are recorded in the log.\n' "$(human_duration $((SECONDS - start)))"
+    } | sed '1{/^$/d}' | cat -s | fold -s -w $((W - 6)) >"$out.txt"
+    if (($(wc -l <"$out.txt") + 6 <= H)); then
+        whiptail --title "$TITLE — $heading" --msgbox "$(<"$out.txt")" $(($(wc -l <"$out.txt") + 6)) "$W"
+    else
+        textbox "$TITLE — $heading" "$out.txt"
+    fi
+    rm -f "$out" "$out.txt"
+    return "$rc"
+}
+
+# Leaves the gauge cleanly when the operation is interrupted
+ui_abort() {
+    ((UI)) || return 0
+    UI=0
+    exec 8>&-
+    kill "$GAUGE_PID" 2>/dev/null
+    wait "$GAUGE_PID" 2>/dev/null
+    # the operation runs with its input and output redirected: the terminal
+    # is addressed directly
+    stty sane </dev/tty 2>/dev/null
+    clear >/dev/tty
+    echo "Interrupted." >/dev/tty
+}
+
+# Notice displayed while a dialog is being prepared. With its own terminal
+# type whiptail would erase the box as soon as it is drawn.
+busy() {
+    dims
+    TERM=ansi whiptail --title "$TITLE" --infobox "$1" 7 "$W"
+}
+
+# A few steps need the plain terminal, because text has to be copied from it
+# or pasted into it: the authorization command and its token, an SSH key.
+screen() { # heading
     clear
     printf '\033[1m%s — %s\033[0m\n\n' "$TITLE" "$1"
-}
-busy() { # one-line notice shown while a dialog is being prepared
-    clear
-    printf '\n  %s\n' "$1"
-}
-pause() {
-    echo
-    read -rp "Press Enter to return to the menu. " _
-    clear
 }
 
 need_ready() {
@@ -609,10 +742,8 @@ ui_backup() {
     free=$(df -h --output=avail "$STAGING_DIR" 2>/dev/null | tail -n1 | tr -d ' ')
     sel=$(checklist "Select the guests to back up (Space to select, Enter to confirm).\n\nStaging folder: $STAGING_DIR (${free:-?} free)\nMode: $VZDUMP_MODE — compression: $COMPRESS — default retention: $KEEP_DEFAULT" "${items[@]}") || return
     [[ -n $sel ]] || return
-    screen "Backup"
     # shellcheck disable=SC2086
-    backup_guests $sel
-    pause
+    ui_run "Backup" backup_guests $sel
 }
 
 ui_list() {
@@ -648,15 +779,22 @@ ui_delete() {
     [[ -n $sel ]] || return
     n=$(wc -l <<<"$sel")
     confirm_no "Delete $n backup(s) from $DEST_NAME?\n\nDeleted files remain in the recycle bin of the account, still encrypted, until it is emptied." || return
-    screen "Deletion"
-    acquire_lock || { pause; return; }
-    for i in $sel; do
+    # shellcheck disable=SC2086
+    ui_run "Deletion on $DEST_NAME" op_delete $sel
+}
+
+op_delete() { # indexes in BACKUPS
+    local i n=0
+    acquire_lock || return 1
+    for i; do
         log "Deleting $(cut -f6 <<<"${BACKUPS[$i]}")"
         delete_backup "$(cut -f6 <<<"${BACKUPS[$i]}")" || log "ERROR: deletion failed"
+        n=$((n + 1))
+        gauge $((n * 100 / $#)) ""
     done
     rclone rmdirs "$CRYPT_REMOTE:" --leave-root 2>>"$LOG_FILE"
     release_lock
-    pause
+    log "Done: $# backup(s) processed."
 }
 
 valid_count() { [[ $1 =~ ^[0-9]+$ ]]; }
@@ -703,19 +841,30 @@ ui_retention() {
 ui_prune() {
     need_ready || return
     confirm_no "Apply the retention policy now?\n\nFor each guest, the backups in excess of the configured number of versions will be deleted from $DEST_NAME, oldest first." || return
-    screen "Retention"
-    acquire_lock || { pause; return; }
-    prune_remote
+    ui_run "Retention on $DEST_NAME" op_locked prune_remote
+}
+
+# Runs a command while holding the lock
+op_locked() { # command…
+    local rc
+    acquire_lock || return 1
+    "$@"
+    rc=$?
     release_lock
-    pause
+    return "$rc"
 }
 
 ui_about() {
     need_ready || return
     local out
-    busy "Querying the $DEST_NAME account…"
-    out=$(rclone about "$BASE_REMOTE:" 2>&1)
-    msg "Storage of the $DEST_NAME account:\n\n$out"
+    busy "Querying $DEST_NAME…"
+    if out=$(rclone about "$BASE_REMOTE:" 2>/dev/null); then
+        msg "Storage of the $DEST_NAME account:\n\n$out"
+    else
+        # no quota information (S3, some SFTP servers): size of the backups
+        out=$(rclone size "$CRYPT_REMOTE:" 2>&1)
+        msg "Space used by the backups on $DEST_NAME:\n\n$out"
+    fi
 }
 
 ui_manage() {
@@ -759,7 +908,7 @@ ui_restore() {
     pick_dest || return
     load_backups || return
     ((${#BACKUPS[@]})) || { msg "No backup was found on $DEST_NAME."; return; }
-    local items=() i sel id ts type name size path action target storage tmp file rc
+    local items=() i sel id ts type name size path action target storage
     local force=() unique=() free
     for i in "${!BACKUPS[@]}"; do
         items+=("$i" "$(backup_label "${BACKUPS[$i]}")")
@@ -789,13 +938,7 @@ ui_restore() {
     D)
         target=$(input "Destination folder:" "$STAGING_DIR") || return
         [[ -d $target && -w $target ]] || { msg "The folder does not exist or is not writable."; return; }
-        screen "Download"
-        acquire_lock || { pause; return; }
-        log "Downloading $path to $target"
-        rclone_copy "$CRYPT_REMOTE:$path" "$target" &&
-            log "Archive available: $target/$(basename "$path")"
-        release_lock
-        pause
+        ui_run "Download from $DEST_NAME" op_locked op_download "$path" "$target"
         return
         ;;
     esac
@@ -807,17 +950,33 @@ ui_restore() {
         return
     fi
 
-    screen "Restore"
-    acquire_lock || { pause; return; }
-    tmp=$(mktemp -d "$STAGING_DIR/proxdump.XXXXXX") || { release_lock; pause; return; }
+    ui_run "Restore of $type $target" op_locked op_restore "$path" "$type" "$target" "$storage" "${force[@]}" "${unique[@]}"
+}
+
+op_download() { # archive path on the remote, local folder
+    log "Downloading $1 to $2"
+    if rclone_copy "$CRYPT_REMOTE:$1" "$2"; then
+        log "Archive available: $2/$(basename "$1")"
+    else
+        log "ERROR: download from $DEST_NAME failed."
+        return 1
+    fi
+}
+
+op_restore() { # archive path on the remote, type, target ID, storage, options…
+    local path=$1 type=$2 target=$3 storage=$4 tmp file rc
+    shift 4
+    tmp=$(mktemp -d "$STAGING_DIR/proxdump.XXXXXX") || return 1
     CLEANUP_DIRS+=("$tmp")
     log "=== Restoring $path to $type $target (storage $storage) ==="
+    log "Downloading the archive from $DEST_NAME…"
     if rclone_copy "$CRYPT_REMOTE:$path" "$tmp"; then
         file="$tmp/$(basename "$path")"
+        log "Restoring the archive to storage $storage…"
         if [[ $type == qemu ]]; then
-            run_logged "" qmrestore "$file" "$target" --storage "$storage" "${force[@]}" "${unique[@]}"
+            run_logged "" qmrestore "$file" "$target" --storage "$storage" "$@"
         else
-            run_logged "" pct restore "$target" "$file" --storage "$storage" "${force[@]}" "${unique[@]}"
+            run_logged "" pct restore "$target" "$file" --storage "$storage" "$@"
         fi
         rc=$?
         if ((rc == 0)); then
@@ -827,10 +986,10 @@ ui_restore() {
         fi
     else
         log "ERROR: download from $DEST_NAME failed."
+        rc=1
     fi
     rm -rf -- "$tmp"
-    release_lock
-    pause
+    return "$rc"
 }
 
 # --- Configuration -----------------------------------------------------------
@@ -932,6 +1091,140 @@ EOF
     read -e -r -p "Client secret > " GD_CLIENT_SECRET || return 1
     GD_CLIENT_SECRET=$(tr -d '[:space:]' <<<"$GD_CLIENT_SECRET")
     [[ -n $GD_CLIENT_SECRET ]]
+}
+
+# Destinations reached with keys rather than through a browser are written
+# straight into rclone.conf, so that their secrets never appear on a command
+# line visible in 'ps'.
+write_remote_section() { # 'key = value' lines
+    install -d -m 700 "$CONF_DIR"
+    touch "$RCLONE_CONFIG"
+    chmod 600 "$RCLONE_CONFIG"
+    rclone config delete "$BASE_REMOTE" 2>/dev/null
+    printf '\n[%s]\ntype = %s\n%s\n' "$BASE_REMOTE" "${DEST_TYPES[$DEST]}" "$1" >>"$RCLONE_CONFIG"
+}
+
+trim() { sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<<"$1"; }
+
+# S3-compatible storage: provider, endpoint, access key and bucket
+s3_setup() {
+    local provider hint="" endpoint="" region="" key secret bucket conf
+    provider=$(menu "Select the provider of the S3-compatible storage:" \
+        B2 "Backblaze B2" \
+        Cloudflare "Cloudflare R2" \
+        Wasabi "Wasabi" \
+        AWS "Amazon S3" \
+        Hetzner "Hetzner Object Storage" \
+        OVHcloud "OVHcloud Object Storage" \
+        Scaleway "Scaleway Object Storage" \
+        Minio "MinIO (self-hosted)" \
+        Other "Another S3-compatible service") || return 1
+    case $provider in
+    B2) hint="shown on the bucket in the Backblaze console, for instance s3.us-west-004.backblazeb2.com" ;;
+    Cloudflare) hint="<account ID>.r2.cloudflarestorage.com, shown on the R2 overview page" ;;
+    Wasabi) hint="for instance s3.eu-central-1.wasabisys.com" ;;
+    Hetzner) hint="for instance fsn1.your-objectstorage.com" ;;
+    OVHcloud) hint="for instance s3.gra.io.cloud.ovh.net" ;;
+    Scaleway) hint="for instance s3.fr-par.scw.cloud" ;;
+    Minio | Other) hint="host name or URL, for instance https://storage.example.org:9000" ;;
+    esac
+    if [[ $provider == AWS ]]; then
+        region=$(input "Region of the bucket (for instance us-east-1):") || return 1
+        region=$(trim "$region")
+        [[ -n $region ]] || { msg "The region is required for Amazon S3."; return 1; }
+    else
+        endpoint=$(input "Endpoint of the service ($hint):") || return 1
+        endpoint=$(trim "$endpoint")
+        [[ -n $endpoint ]] || { msg "The endpoint may not be empty."; return 1; }
+        case $provider in
+        Cloudflare) region=auto ;;
+        B2) ;;
+        *)
+            region=$(input "Region, if the provider requires one (otherwise leave empty):") || return 1
+            region=$(trim "$region")
+            ;;
+        esac
+    fi
+    key=$(input "Access key ID (for Backblaze: keyID of an application key):") || return 1
+    key=$(trim "$key")
+    secret=$(password "Secret access key (for Backblaze: applicationKey):") || return 1
+    secret=$(trim "$secret")
+    [[ -n $key && -n $secret ]] || { msg "The access key and its secret are both required."; return 1; }
+    bucket=$(input "Name of the bucket that will hold the backups.\n\nThe bucket must already exist; this tool does not create it." "${DEST_ROOT[s3]:-}") || return 1
+    bucket=$(trim "$bucket")
+    [[ -n $bucket && $bucket != */* ]] || { msg "The bucket name is not valid."; return 1; }
+
+    [[ $provider == B2 ]] && provider=Other
+    conf="provider = $provider"$'\n'"access_key_id = $key"$'\n'"secret_access_key = $secret"
+    [[ -n $endpoint ]] && conf+=$'\n'"endpoint = $endpoint"
+    [[ -n $region ]] && conf+=$'\n'"region = $region"
+    # the bucket exists already, and a key restricted to it may not list or
+    # create buckets
+    conf+=$'\n'"no_check_bucket = true"
+    write_remote_section "$conf"
+    DEST_ROOT[s3]=$bucket
+    save_config
+}
+
+# SFTP server: host, account, key or password, host key, folder
+sftp_setup() {
+    local host port user auth conf key="$CONF_DIR/sftp_key" known="$CONF_DIR/sftp_known_hosts" scan folder pass
+    host=$(input "Host name or IP address of the SFTP server:") || return 1
+    host=$(trim "$host")
+    [[ -n $host && $host != *[[:space:]/]* ]] || { msg "The host name is not valid."; return 1; }
+    port=$(input "SSH port of the server:" "22") || return 1
+    [[ $port =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || { msg "The port is not valid."; return 1; }
+    user=$(input "User name on the server:") || return 1
+    user=$(trim "$user")
+    [[ -n $user ]] || { msg "The user name may not be empty."; return 1; }
+
+    # the identity of the server is recorded now and checked at every connection
+    busy "Contacting $host…"
+    scan=$(ssh-keyscan -T 10 -p "$port" "$host" 2>/dev/null)
+    [[ -n $scan ]] || { msg "No SSH server answered at $host, port $port."; return 1; }
+    confirm "The server presents the following host keys:\n\n$(ssh-keygen -lf - <<<"$scan" | awk '{print "  " $NF " " $2}')\n\nThey will be recorded, and the connection refused if they ever change. Compare them with those of the server if you have them.\n\nDo you wish to continue?" || return 1
+
+    auth=$(menu "Select how this server signs in to $host:" \
+        K "SSH key dedicated to this tool (recommended)" \
+        P "Password") || return 1
+    conf="host = $host"$'\n'"port = $port"$'\n'"user = $user"
+    install -d -m 700 "$CONF_DIR"
+    case $auth in
+    K)
+        if [[ ! -f $key ]]; then
+            ssh-keygen -q -t ed25519 -N "" -C "proxdump@$(hostname -s)" -f "$key" ||
+                { msg "The SSH key could not be generated."; return 1; }
+        fi
+        chmod 600 "$key"
+        screen "SFTP server: SSH key"
+        cat <<EOF
+The following public key identifies this server. Add it, on a single line,
+to the file ~/.ssh/authorized_keys of the account '$user' on $host (or
+through the control panel of the hosting provider):
+
+$(cat "$key.pub")
+
+EOF
+        read -rp "Press Enter once the key has been added. " _
+        conf+=$'\n'"key_file = $key"
+        ;;
+    P)
+        pass=$(password "Password of '$user' on $host:") || return 1
+        [[ -n $pass ]] || { msg "The password may not be empty."; return 1; }
+        pass=$(printf '%s\n' "$pass" | rclone obscure -) || return 1
+        conf+=$'\n'"pass = $pass"
+        ;;
+    esac
+    folder=$(input "Folder of the server that will hold the backups (created if necessary).\n\nA path without a leading '/' is relative to the home folder of '$user'; leave empty to use the home folder itself." "${DEST_ROOT[sftp]-backups}") || return 1
+    folder=$(trim "$folder")
+    [[ $folder != / ]] && folder=${folder%/}
+
+    printf '%s\n' "$scan" >"$known"
+    chmod 600 "$known"
+    conf+=$'\n'"known_hosts_file = $known"
+    write_remote_section "$conf"
+    DEST_ROOT[sftp]=$folder
+    save_config
 }
 
 # Drives rclone's configuration wizard, one question at a time, for the
@@ -1036,39 +1329,88 @@ EOF
     return 0
 }
 
-# Deletes the token stored on this server. The authorization itself can only
-# be withdrawn on the provider's side: the user is told where.
+# Deletes the credentials stored on this server. An authorization can only be
+# withdrawn on the provider's side: the user is told where.
 ui_remove_remote() {
     local n note="" where
     load_schedules
     n=${#SCHEDULES[@]}
     ((n)) && note="\n\n$n schedule(s) are defined: those that use $DEST_NAME will fail until a connection is configured again."
-    confirm_no "Remove the $DEST_NAME connection from this server?\n\nThe access token stored in $RCLONE_CONFIG will be deleted. The backups on $DEST_NAME and the encryption passphrase are kept.$note\n\nDo you wish to continue?" || return
+    confirm_no "Remove the $DEST_NAME connection from this server?\n\nThe credentials stored in $RCLONE_CONFIG will be deleted. The backups on $DEST_NAME and the encryption passphrase are kept.$note\n\nDo you wish to continue?" || return
     rclone config delete "$BASE_REMOTE" 2>>"$LOG_FILE"
     if has_remote "$BASE_REMOTE"; then
         msg "The $DEST_NAME connection could not be removed. Please consult the log."
         return
     fi
+    keepalive_set "$DEST" off
     log "$DEST_NAME connection removed from this server." >/dev/null
     case $DEST in
-    onedrive) where="  Personal account:\n    https://account.microsoft.com/privacy/app-access\n\n  Work or school account:\n    https://myapps.microsoft.com" ;;
-    gdrive) where="  https://myaccount.google.com/connections" ;;
+    onedrive) where="The authorization granted to rclone remains registered with Microsoft. To withdraw it as well, remove the application from the list of authorized applications:\n\n  Personal account:\n    https://account.microsoft.com/privacy/app-access\n\n  Work or school account:\n    https://myapps.microsoft.com" ;;
+    gdrive) where="The authorization granted to rclone remains registered with Google. To withdraw it as well, remove the application from the list of authorized applications:\n\n  https://myaccount.google.com/connections" ;;
+    dropbox) where="The authorization granted to rclone remains registered with Dropbox. To withdraw it as well, remove the application from the list of connected applications:\n\n  https://www.dropbox.com/account/connected_apps" ;;
+    s3) where="The access key itself remains valid. To withdraw it as well, delete it in the console of the storage provider." ;;
+    sftp) where="The SSH key of this tool ($CONF_DIR/sftp_key) is kept for a later connection. To withdraw its access, remove its line from ~/.ssh/authorized_keys on the server." ;;
     esac
-    msg "The $DEST_NAME connection has been removed from this server.\n\nThe authorization granted to rclone remains registered with ${DEST_VENDORS[$DEST]}. To withdraw it as well, sign in to the account and remove the application from the list of authorized applications:\n\n$where"
+    msg "The $DEST_NAME connection has been removed from this server.\n\n$where"
+}
+
+# Daily task that only queries the account, so that a token which is not
+# used by any schedule does not lapse
+ui_keepalive() {
+    if keepalive_on "$DEST"; then
+        confirm "The daily token refresh is enabled for $DEST_NAME.\n\nDo you wish to disable it?" || return
+        keepalive_set "$DEST" off
+    else
+        confirm "The $DEST_NAME access token lapses when it stays unused for ${DEST_TOKEN_LIFE[$DEST]}; the connection then has to be configured again.\n\nA daily task (at $KEEPALIVE_TIME) can query the account for the sole purpose of keeping the token active. It transfers no data, and its result is recorded in the log.\n\nThis is unnecessary when a schedule already backs up to $DEST_NAME regularly.\n\nDo you wish to enable it?" || return
+        keepalive_set "$DEST" on
+    fi
 }
 
 ui_setup_remote() { # for the current destination
-    local choice
+    local choice items bak root
     if has_remote "$BASE_REMOTE"; then
-        choice=$(CANCEL=Back menu "A $DEST_NAME connection is configured.\n\nReplacing or removing it does not affect the backups already uploaded." \
-            R "Replace the connection (sign in again, or use another account)" \
-            D "Remove the connection from this server") || return
-        [[ $choice == D ]] && { ui_remove_remote; return; }
+        while :; do
+            if [[ -n ${DEST_VENDORS[$DEST]:-} ]]; then
+                items=(R "Replace the connection (sign in again, or use another account)")
+            else
+                items=(R "Replace the connection (enter its settings again)")
+            fi
+            [[ -n ${DEST_TOKEN_LIFE[$DEST]:-} ]] &&
+                items+=(K "Daily token refresh: $(keepalive_on "$DEST" && echo enabled || echo disabled)")
+            items+=(D "Remove the connection from this server")
+            choice=$(CANCEL=Back menu "The $DEST_NAME connection is configured.\n\nReplacing or removing it does not affect the backups already uploaded." "${items[@]}") || return
+            case $choice in
+            K) ui_keepalive ;;
+            D) ui_remove_remote; return ;;
+            R) break ;;
+            esac
+        done
+    fi
+    install -d -m 700 "$CONF_DIR"
+    if [[ -z ${DEST_VENDORS[$DEST]:-} ]]; then
+        # entered by hand: kept only if it works, or if the user insists
+        bak=$(mktemp)
+        root=${DEST_ROOT[$DEST]-}
+        [[ -f $RCLONE_CONFIG ]] && cp -p "$RCLONE_CONFIG" "$bak"
+        if ! "${DEST}_setup"; then
+            rm -f "$bak"
+            msg "The $DEST_NAME connection was not completed. The previous configuration, if any, is unchanged."
+            return
+        fi
+        ensure_crypt
+        has_remote "$CRYPT_REMOTE" &&
+            rclone config update "$CRYPT_REMOTE" remote="$(dest_base "$DEST")" --no-obscure >/dev/null 2>>"$LOG_FILE"
+        if ! ui_test && ! confirm_no "Do you wish to keep these settings nevertheless?\n\nOtherwise the previous configuration, if any, is restored."; then
+            if [[ -s $bak ]]; then cp -p "$bak" "$RCLONE_CONFIG"; else rclone config delete "$BASE_REMOTE" 2>/dev/null; fi
+            DEST_ROOT[$DEST]=$root
+            save_config
+        fi
+        rm -f "$bak"
+        return
     fi
     choice=$(menu "Select the method used to connect to $DEST_NAME:" \
         G "Guided configuration (recommended)" \
         M "Manual rclone configuration (special cases)") || return
-    install -d -m 700 "$CONF_DIR"
     case $choice in
     G)
         remote_wizard || { msg "The $DEST_NAME connection was not completed. The previous configuration, if any, is unchanged."; return; }
@@ -1084,11 +1426,29 @@ ui_setup_remote() { # for the current destination
     ui_test
 }
 
+# Checks that the current destination answers, and prints what it reports
+dest_probe() {
+    local root opts=(--contimeout 15s --timeout 30s --retries 1 --low-level-retries 1)
+    if [[ -n ${DEST_VENDORS[$DEST]:-} ]]; then
+        rclone about "$BASE_REMOTE:" "${opts[@]}"
+        return
+    fi
+    root=${DEST_ROOT[$DEST]:-}
+    if [[ $DEST == sftp && -n $root ]]; then
+        rclone mkdir "$BASE_REMOTE:$root" "${opts[@]}" || return 1
+    fi
+    rclone lsf --max-depth 1 "$BASE_REMOTE:$root" "${opts[@]}" >/dev/null || return 1
+    case $DEST in
+    s3) echo "The bucket '$root' is accessible." ;;
+    *) echo "The folder '${root:-(home folder)}' is accessible." ;;
+    esac
+}
+
 ui_test() {
     local out
     has_remote "$BASE_REMOTE" || { msg "The $DEST_NAME connection is not configured."; return 1; }
     busy "Testing the $DEST_NAME connection…"
-    if out=$(rclone about "$BASE_REMOTE:" 2>&1); then
+    if out=$(dest_probe 2>&1); then
         msg "The $DEST_NAME connection is operational.\n\n$out"
     else
         msg "The $DEST_NAME connection failed:\n\n$(tail -n 8 <<<"$out")"
@@ -1131,8 +1491,8 @@ write_crypt_section() { # obscured passphrase, destinations (default: all)
     chmod 600 "$RCLONE_CONFIG"
     for id; do
         rclone config delete "$id-crypt" 2>/dev/null
-        printf '\n[%s]\ntype = crypt\nremote = %s:%s\npassword = %s\n%s\n' \
-            "$id-crypt" "$id" "$REMOTE_DIR" "$obscured" "$CRYPT_NAMES" >>"$RCLONE_CONFIG"
+        printf '\n[%s]\ntype = crypt\nremote = %s\npassword = %s\n%s\n' \
+            "$id-crypt" "$(dest_base "$id")" "$obscured" "$CRYPT_NAMES" >>"$RCLONE_CONFIG"
     done
 }
 
@@ -1162,9 +1522,10 @@ write_crypt_remote() { # passphrase
 # so the backups already uploaded are only renamed there (nothing is
 # uploaded again).
 migrate_names() {
-    local obscured json err base="$BASE_REMOTE:$REMOTE_DIR" path old enc n=0 failed=0
+    local obscured json err base path old enc n=0 failed=0
     obscured=$(obscured_passphrase)
     [[ -n $obscured ]] || return 1
+    base=$(dest_base "$DEST")
     err=$(mktemp)
     if ! json=$(rclone lsjson -R --files-only --encrypted "$CRYPT_REMOTE:" 2>"$err"); then
         if grep -q "directory not found" "$err"; then
@@ -1199,11 +1560,7 @@ migrate_names() {
 
 ui_migrate_names() {
     confirm "The backups on $DEST_NAME are stored under encrypted file names, as produced by an earlier version.\n\nThis version stores them under their original names followed by '.encrypted'. The existing backups can be renamed accordingly; their contents remain encrypted and nothing is uploaded again.\n\nDo you wish to convert them now?" || return
-    screen "Conversion of the file names"
-    acquire_lock || { pause; return; }
-    migrate_names
-    release_lock
-    pause
+    ui_run "Conversion of the file names on $DEST_NAME" op_locked migrate_names
 }
 
 ui_setup_crypt() {
@@ -1251,7 +1608,7 @@ ui_remote_dir() {
     save_config
     for id in "${DEST_IDS[@]}"; do
         has_remote "$id-crypt" &&
-            rclone config update "$id-crypt" remote="$id:$REMOTE_DIR" --no-obscure >/dev/null 2>>"$LOG_FILE"
+            rclone config update "$id-crypt" remote="$(dest_base "$id")" --no-obscure >/dev/null 2>>"$LOG_FILE"
     done
 }
 
@@ -1349,25 +1706,69 @@ ui_config() {
 
 # Each schedule is one line of $CRON_FILE:
 #   MIN HOUR * * DOW root <proxdump> backup --to DEST (--all | ID…) >/dev/null 2>&1
+# and so is each daily token refresh:
+#   MIN HOUR * * * root <proxdump> keepalive --to DEST >/dev/null 2>&1
 SCHEDULES=()
+KEEPALIVES=()
+KEEPALIVE_TIME="12:17"
 
 load_schedules() {
     SCHEDULES=()
+    KEEPALIVES=()
     [[ -f $CRON_FILE ]] || return 0
     mapfile -t SCHEDULES < <(grep -E '^[0-9]+ [0-9]+ \* \* [0-9*] root [^ ]+ backup ' "$CRON_FILE")
+    mapfile -t KEEPALIVES < <(grep -E '^[0-9]+ [0-9]+ \* \* \* root [^ ]+ keepalive --to [a-z0-9]+ ' "$CRON_FILE")
 }
 
 save_schedules() {
-    if ((${#SCHEDULES[@]} == 0)); then
+    if ((${#SCHEDULES[@]} + ${#KEEPALIVES[@]} == 0)); then
         rm -f "$CRON_FILE"
         return
     fi
     {
-        echo "# Generated by proxdump — edit through the 'Automatic scheduling' menu"
+        echo "# Generated by proxdump — edit through the 'Automatic scheduling' and 'Configuration' menus"
         echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        printf '%s\n' "${SCHEDULES[@]}"
+        ((${#SCHEDULES[@]})) && printf '%s\n' "${SCHEDULES[@]}"
+        ((${#KEEPALIVES[@]})) && printf '%s\n' "${KEEPALIVES[@]}"
     } >"$CRON_FILE"
     chmod 644 "$CRON_FILE"
+}
+
+self_path() {
+    command -v proxdump || readlink -f "${BASH_SOURCE[0]}"
+}
+
+keepalive_on() { # id
+    [[ -f $CRON_FILE ]] && grep -qE " keepalive --to $1 " "$CRON_FILE"
+}
+
+keepalive_set() { # id, on|off
+    local line kept=()
+    load_schedules
+    for line in "${KEEPALIVES[@]}"; do
+        [[ $line == *" keepalive --to $1 "* ]] || kept+=("$line")
+    done
+    [[ $2 == on ]] &&
+        kept+=("$((10#${KEEPALIVE_TIME#*:})) $((10#${KEEPALIVE_TIME%:*})) * * * root $(self_path) keepalive --to $1 >/dev/null 2>&1")
+    KEEPALIVES=("${kept[@]}")
+    save_schedules
+}
+
+# Queries the account of each destination in DESTS whose token can lapse:
+# rclone renews the token on the way and saves it.
+keepalive() {
+    local d out rc=0
+    for d in "${DESTS[@]}"; do
+        [[ -n ${DEST_TOKEN_LIFE[$d]:-} ]] || continue
+        use_dest "$d"
+        if out=$(rclone about "$BASE_REMOTE:" --retries 2 2>&1); then
+            log "$DEST_NAME token refreshed."
+        else
+            log "ERROR: the $DEST_NAME token could not be refreshed: $(tail -n 1 <<<"$out")"
+            rc=1
+        fi
+    done
+    return "$rc"
 }
 
 # Splits a cron line into S_MIN, S_HOUR, S_DOW, S_DEST and S_TARGETS
@@ -1403,10 +1804,8 @@ ui_schedule_run() { # cron line
         [[ -n ${ids// /} ]] || { msg "No virtual machine or container was found on this node."; return; }
     fi
     confirm "Run the following schedule now?\n\n$(schedule_label "$1")\n\nThe schedule itself is not modified." || return
-    screen "Backup"
     # shellcheck disable=SC2086
-    backup_guests $ids
-    pause
+    ui_run "Backup" backup_guests $ids
 }
 
 ui_schedule_add() {
@@ -1442,7 +1841,7 @@ ui_schedule_add() {
         targets=${targets% }
     fi
 
-    self=$(command -v proxdump || readlink -f "${BASH_SOURCE[0]}")
+    self=$(self_path)
     line="$min $hour * * $dow root $self backup --to $dest $targets >/dev/null 2>&1"
     load_schedules
     for id in "${SCHEDULES[@]}"; do
@@ -1497,7 +1896,7 @@ main_menu() {
     local id
     ensure_crypt
     if [[ -z $(dest_list) ]]; then
-        msg "proxdump has not been configured yet.\n\nBefore the first backup, please open the 'Configuration' menu in order to:\n\n  1. connect at least one destination (OneDrive, Google Drive);\n  2. define the encryption passphrase;\n  3. select the local staging folder for vzdump."
+        msg "proxdump has not been configured yet.\n\nBefore the first backup, please open the 'Configuration' menu in order to:\n\n  1. connect at least one destination;\n  2. define the encryption passphrase;\n  3. select the local staging folder for vzdump."
     fi
     for id in $(dest_list | cut -f1); do
         use_dest "$id"
@@ -1527,7 +1926,7 @@ main_menu() {
 
 usage() {
     cat <<EOF
-proxdump $VERSION — encrypted Proxmox VE backup to OneDrive and Google Drive
+proxdump $VERSION — encrypted Proxmox VE backup to cloud storage
 
 Usage:
   proxdump                               open the menus
@@ -1535,6 +1934,7 @@ Usage:
   proxdump backup [--to DEST] ID [ID…]   back up the given guests
   proxdump list [--to DEST]              list the stored backups
   proxdump prune [--to DEST]             apply retention
+  proxdump keepalive [--to DEST]         renew the access tokens that can lapse
   proxdump --version | --help
 
 DEST is one or more destinations separated by commas: ${DEST_IDS[*]}.
@@ -1593,6 +1993,11 @@ main() {
                 echo
             done < <(remote_list)
         done
+        ;;
+    keepalive)
+        # while another operation runs, the tokens are in use anyway
+        acquire_lock >/dev/null || exit 0
+        keepalive || exit 1
         ;;
     prune)
         acquire_lock || exit 1

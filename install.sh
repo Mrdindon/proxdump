@@ -15,7 +15,7 @@ SRC_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 if [[ ${1:-} == --uninstall ]]; then
     rm -f "$BIN" /etc/cron.d/proxdump
     echo "proxdump removed."
-    echo "Kept on purpose: $CONF_DIR (OneDrive token, passphrase) and /var/log/proxdump.log."
+    echo "Kept on purpose: $CONF_DIR (credentials, passphrase) and /var/log/proxdump.log."
     echo "To erase everything: rm -rf $CONF_DIR /var/log/proxdump.log"
     exit 0
 fi

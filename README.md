@@ -1,14 +1,16 @@
 # proxdump
 
 **Encrypted** backup of the virtual machines and containers of a
-**Proxmox VE** node to **Microsoft OneDrive** and/or **Google Drive**,
-driven by `whiptail` menus.
+**Proxmox VE** node to **Microsoft OneDrive**, **Google Drive**,
+**Dropbox**, any **S3-compatible storage** (Backblaze B2, Cloudflare R2,
+Wasabi, Amazon S3, MinIO…) or an **SFTP server**, driven by `whiptail` menus.
 
 - backs up VMs (QEMU) and containers (LXC) with `vzdump`;
 - encrypts the contents on the server *before* upload; file names stay
   legible and carry an `.encrypted` suffix;
 - one archive can be uploaded to several destinations in the same run;
-- readable progress bars for `vzdump` and for the transfers;
+- progress and results displayed in dialogs, for `vzdump` and for the
+  transfers alike;
 - credentials and passphrase are stored locally for subsequent runs;
 - manages the backups already uploaded: list, delete, number of versions
   kept (global or per guest);
@@ -37,7 +39,7 @@ driven by `whiptail` menus.
 3. [Installation](#installation)
 4. [Initial configuration](#initial-configuration)
 5. [Backing up](#backing-up)
-6. [Managing backups on OneDrive](#managing-backups-on-onedrive)
+6. [Managing the stored backups](#managing-the-stored-backups)
 7. [Restoring](#restoring)
 8. [Disaster recovery](#disaster-recovery-server-lost)
 9. [Scheduling and command line](#scheduling-and-command-line)
@@ -49,7 +51,7 @@ driven by `whiptail` menus.
 ## How it works
 
 ```
- guest (VM/CT)                 local staging folder         OneDrive / Google Drive
+ guest (VM/CT)                 local staging folder             destination(s)
 ┌─────────────┐   vzdump     ┌─────────────────────────┐  rclone  ┌──────────────────────┐
 │ 100 web     │ ───────────▶ │ vzdump-qemu-100-….vma.zst│ ──────▶ │ pve-backups/<node>/  │
 └─────────────┘              │ (plaintext, deleted after)│  crypt │  ….vma.zst.encrypted │
@@ -93,11 +95,13 @@ interface, without this tool.
 ## Requirements
 
 - a Proxmox VE node (developed and tested on PVE 9 / Debian 13), root access;
-- a Microsoft OneDrive account (personal or business) and/or a Google
-  account, with enough space;
+- at least one destination with enough space: a Microsoft OneDrive
+  account (personal or business), a Google account, a Dropbox account, a
+  bucket on an S3-compatible service, or an account on an SFTP server;
 - a local folder that can temporarily hold the largest archive;
-- for the first connection: a computer with a web browser and
-  [rclone](https://rclone.org/downloads/) (Windows, macOS or Linux).
+- for the first connection to OneDrive, Google Drive or Dropbox: a computer
+  with a web browser and [rclone](https://rclone.org/downloads/) (Windows,
+  macOS or Linux). S3 and SFTP need nothing else than their keys.
 
 Dependencies installed by `install.sh` if missing: `rclone` (official
 package, Debian's being too old for OneDrive), `jq`, `whiptail`, `curl`.
@@ -117,7 +121,7 @@ To remove: `./install.sh --uninstall` (the configuration is kept).
 ## Initial configuration
 
 Run `proxdump` as root and open **Configuration**. Three steps: connect
-at least one destination (OneDrive, Google Drive, or both), define the
+at least one destination (as many as you wish), define the
 encryption passphrase, and review the folders and options.
 
 ### 1. OneDrive connection
@@ -319,6 +323,79 @@ up to date by the rclone project, is at
 Replacing and removing the connection work as for OneDrive. To withdraw the
 authorization on Google's side: <https://myaccount.google.com/connections>.
 
+### 1c. Dropbox connection
+
+**Configuration → Dropbox connection → Guided configuration** works exactly
+like OneDrive, without the drive selection: run on your computer the command
+displayed (`rclone authorize "dropbox"`), sign in to Dropbox in the browser,
+then paste the token on the server. To withdraw the authorization on
+Dropbox's side: <https://www.dropbox.com/account/connected_apps>.
+
+### 1d. S3-compatible storage
+
+No browser is involved: the connection uses an access key created in the
+console of the provider. **Configuration → S3 storage connection** asks for:
+
+| Question | What to enter |
+|---|---|
+| Provider | Backblaze B2, Cloudflare R2, Wasabi, Amazon S3, Hetzner, OVHcloud, Scaleway, MinIO, or another S3-compatible service |
+| Endpoint | The address of the service, shown by the provider next to the bucket (not asked for Amazon S3) |
+| Region | Required for Amazon S3; otherwise only if the provider asks for one |
+| Access key ID and secret access key | A key allowed to read, write and delete in the bucket |
+| Bucket | The name of a bucket that **already exists**; the tool does not create it |
+
+With **Backblaze B2**: create the bucket (private), then under
+**Application Keys** add a key restricted to that bucket with *Read and
+Write* access. The *keyID* is the access key ID, the *applicationKey* is the
+secret access key, and the endpoint is displayed on the bucket
+(`s3.<region>.backblazeb2.com`).
+
+The tool then lists the bucket to check the settings; settings that do not
+work are discarded unless you ask to keep them. The backups are stored in
+the bucket under the folder defined in **Folder on the destinations**.
+
+### 1e. SFTP server
+
+For a NAS, another server of yours, or SFTP storage rented from a hosting
+provider. **Configuration → SFTP server connection** asks for the host, the
+SSH port and the user name, then:
+
+1. **Host keys.** The tool displays the fingerprints presented by the
+   server. Once accepted they are recorded in
+   `/etc/proxdump/sftp_known_hosts`, and a server that later presents
+   other keys is refused.
+2. **Sign-in method.**
+   - *SSH key dedicated to this tool* (recommended): a key is generated in
+     `/etc/proxdump/sftp_key` and its public half is displayed. Add that
+     line to `~/.ssh/authorized_keys` of the account on the server (or
+     through the provider's control panel), then press Enter.
+   - *Password*: stored obscured in `rclone.conf`.
+3. **Folder.** Where the backups go on the server: a path relative to the
+   home folder of the account, or an absolute path. It is created if
+   necessary.
+
+After each upload the archive is compared with its source by checksum. A
+server that offers no shell (and therefore no `md5sum`) only allows the
+sizes to be compared; the log says which of the two was done.
+
+### Keeping the access tokens alive
+
+The connections made through a browser rely on a token that the provider
+cancels when it stays unused for too long:
+
+| Destination | The token lapses after |
+|---|---|
+| OneDrive | 90 days without use |
+| Google Drive | 6 months without use |
+| Dropbox, S3, SFTP | never (until the access is withdrawn) |
+
+A destination that is backed up to regularly is never concerned. For one
+that is used occasionally, open its entry in **Configuration** and enable
+**Daily token refresh**: a daily cron task (12:17) queries the account for
+the sole purpose of renewing the token. It transfers no data and records
+its result in the log. The option only appears for OneDrive and Google
+Drive. Neither provider lets the remaining lifetime of a token be queried.
+
 ### 2. Encryption
 
 A single passphrase protects every destination.
@@ -361,21 +438,30 @@ backups in place, without uploading them again.
 
 Menu **1 – Back up virtual machines and containers**: select the guests (space bar),
 confirm. When several destinations are configured, the tool first asks which
-ones to use; the archive is created once and uploaded to each of them. `vzdump` and then the upload each show a progress bar in the
-terminal (percentage, size, speed, time). A container archive reports no
-percentage, so the size written so far is shown instead. A failure on one guest does not stop the following ones; the final
-summary gives the number of successes.
+ones to use; the archive is created once and uploaded to each of them.
+
+Every operation started from the menus (backup, restore, download,
+deletion, retention) runs behind a progress dialog that shows the guest
+being processed, the current step, and its details: percentage, size, speed
+and remaining time. A container archive reports no percentage, so the size
+written so far is shown instead; the verification shows the time elapsed. At
+the end, a summary gives the outcome and what failed, and the complete
+output is kept in the log (menu **6 – Log**). **Ctrl-C** interrupts the
+operation and cleans up the staging folder.
+
+A failure on one guest does not stop the following ones; the summary gives
+the number of successes.
 
 Tip: run the tool inside `tmux` or `screen` for large backups, so that a
 dropped SSH session does not interrupt the upload.
 
-## Managing backups on OneDrive
+## Managing the stored backups
 
 When several destinations are configured, the tool first asks which one to
 manage; each destination has its own list, and the retention settings apply
 to each of them separately.
 
-Menu **3 – Manage the backups on OneDrive**:
+Menu **3 – Manage the stored backups**:
 
 | Entry | Effect |
 |---|---|
@@ -414,11 +500,12 @@ name before starting the copy if the original is still running.
 
 ## Disaster recovery (server lost)
 
-You need: access to the OneDrive or Google account and the **passphrase**.
+You need: access to the destination (the account, or the S3 or SFTP
+credentials) and the **passphrase**.
 
 1. Install Proxmox VE on the new server, then proxdump (`./install.sh`).
-2. **Configuration → OneDrive connection** (or **Google Drive connection**):
-   redo the authorization.
+2. **Configuration → … connection** for the destination that holds the
+   backups: redo the authorization, or enter the same bucket or folder.
 3. **Configuration → Folder on the destinations**: enter the old server's folder, e.g.
    `pve-backups/old-name` (the default uses the new node's name).
 4. **Configuration → Encryption → Enter a passphrase**: enter the
@@ -444,6 +531,9 @@ filename_encryption = off
 directory_name_encryption = false
 suffix = .encrypted
 ```
+
+For S3 the `remote` line is `s3:<bucket>/pve-backups/<node>`, and for SFTP
+`sftp:<folder>/pve-backups/<node>`.
 
 ```bash
 rclone lsf -R onedrive-crypt:
@@ -482,9 +572,11 @@ proxdump backup --to gdrive --all            # one destination only
 proxdump backup --to onedrive,gdrive 100     # several destinations
 proxdump list               # stored backups
 proxdump prune              # apply retention
+proxdump keepalive          # renew the tokens that can lapse (see above)
 ```
 
-Destinations are named `onedrive` and `gdrive`. Without `--to`, every
+Destinations are named `onedrive`, `gdrive`, `dropbox`, `s3` and `sftp`.
+Without `--to`, every
 configured destination is used; `list` and `prune` accept `--to` as well.
 
 `backup` returns the number of failures as its exit status (0 = everything
@@ -496,9 +588,11 @@ succeeded). A lock prevents two operations from running at the same time:
 | File | Contents | Permissions |
 |---|---|---|
 | `/usr/local/bin/proxdump` | The tool | 755 |
-| `/etc/proxdump/rclone.conf` | **Access tokens (OneDrive, Google Drive) and passphrase** | 600, folder 700 |
+| `/etc/proxdump/rclone.conf` | **Access tokens, S3 keys, SFTP password and passphrase** | 600, folder 700 |
+| `/etc/proxdump/sftp_key` | **Private SSH key** used for the SFTP server | 600 |
+| `/etc/proxdump/sftp_known_hosts` | Host keys of the SFTP server | 600 |
 | `/etc/proxdump/config` | Settings (no secrets) | 600 |
-| `/etc/cron.d/proxdump` | Schedules | 644 |
+| `/etc/cron.d/proxdump` | Schedules and daily token refreshes | 644 |
 | `/var/log/proxdump.log` | Operations log | — |
 
 Good to know:
@@ -540,7 +634,9 @@ The details of each operation (`vzdump` and `rclone` output) are in
 - Full backups only (no incremental, no deduplication): each version takes
   its whole compressed size on the destination.
 - Maximum file size on OneDrive: 250 GB per archive. Google Drive accepts
-  larger files but limits uploads to 750 GB per day.
+  larger files but limits uploads to 750 GB per day. Dropbox: 350 GB per
+  archive.
+- A single S3 bucket and a single SFTP server can be configured.
 - Local space for the compressed archive is needed, for backup as well as
   for restore.
 - Restore only exists in the menus (no subcommand).
