@@ -1,93 +1,102 @@
 # onedrivepbs
 
-Sauvegarde **chiffrée** des machines virtuelles et conteneurs d'un nœud
-**Proxmox VE** vers **Microsoft OneDrive**, pilotée par des menus `whiptail`.
+**Encrypted** backup of the virtual machines and containers of a
+**Proxmox VE** node to **Microsoft OneDrive**, driven by `whiptail` menus.
 
-- sauvegarde de VM (QEMU) et de conteneurs (LXC) avec `vzdump` ;
-- chiffrement côté serveur *avant* l'envoi (contenu **et** noms de fichiers) ;
-- identifiants OneDrive et phrase secrète mémorisés localement pour les fois suivantes ;
-- gestion des sauvegardes déjà présentes sur OneDrive : liste, suppression,
-  nombre de versions conservées (global ou par invité) ;
-- restauration sous l'ID d'origine, sous un nouvel ID, ou simple téléchargement ;
-- planification par cron et sous-commandes non interactives.
+- backs up VMs (QEMU) and containers (LXC) with `vzdump`;
+- encrypts the contents on the server *before* upload; file names stay
+  legible and carry an `.encrypted` suffix;
+- readable progress bars for `vzdump` and for the OneDrive transfers;
+- OneDrive credentials and passphrase are stored locally for subsequent runs;
+- manages the backups already on OneDrive: list, delete, number of versions
+  kept (global or per guest);
+- restores under the original ID, under a new ID, or simply downloads;
+- cron scheduling and non-interactive subcommands.
 
 ```
 ┌──────────────────────── onedrivepbs 1.0.0 ────────────────────────┐
-│ Sauvegarde chiffrée Proxmox VE -> OneDrive   (nœud : pve)         │
+│ Encrypted backup of Proxmox VE to OneDrive (node: pve)            │
 │                                                                   │
-│        1  Sauvegarder des VM / conteneurs                         │
-│        2  Restaurer une sauvegarde                                │
-│        3  Gérer les sauvegardes sur OneDrive                      │
-│        4  Planification automatique                               │
+│        1  Back up virtual machines and containers                 │
+│        2  Restore a backup                                        │
+│        3  Manage the backups on OneDrive                          │
+│        4  Automatic scheduling                                    │
 │        5  Configuration                                           │
-│        6  Journal                                                 │
-│        Q  Quitter                                                 │
+│        6  Log                                                     │
+│                                                                   │
+│                  <Ok>                    <Quit>                   │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
-## Sommaire
+## Contents
 
-1. [Fonctionnement](#fonctionnement)
-2. [Prérequis](#prérequis)
+1. [How it works](#how-it-works)
+2. [Requirements](#requirements)
 3. [Installation](#installation)
-4. [Configuration initiale](#configuration-initiale)
-5. [Sauvegarder](#sauvegarder)
-6. [Gérer les sauvegardes sur OneDrive](#gérer-les-sauvegardes-sur-onedrive)
-7. [Restaurer](#restaurer)
-8. [Reprise après sinistre](#reprise-après-sinistre-serveur-perdu)
-9. [Planification et ligne de commande](#planification-et-ligne-de-commande)
-10. [Fichiers et sécurité](#fichiers-et-sécurité)
-11. [Dépannage](#dépannage)
-12. [Limites connues](#limites-connues)
-13. [Développement et tests](#développement-et-tests)
+4. [Initial configuration](#initial-configuration)
+5. [Backing up](#backing-up)
+6. [Managing backups on OneDrive](#managing-backups-on-onedrive)
+7. [Restoring](#restoring)
+8. [Disaster recovery](#disaster-recovery-server-lost)
+9. [Scheduling and command line](#scheduling-and-command-line)
+10. [Files and security](#files-and-security)
+11. [Troubleshooting](#troubleshooting)
+12. [Known limitations](#known-limitations)
+13. [Development and testing](#development-and-testing)
 
-## Fonctionnement
+## How it works
 
 ```
- invité (VM/CT)                dossier temporaire local            OneDrive
+ guest (VM/CT)                 local staging folder                OneDrive
 ┌─────────────┐   vzdump     ┌─────────────────────────┐  rclone  ┌──────────────────────┐
-│ 100 web     │ ───────────▶ │ vzdump-qemu-100-….vma.zst│ ──────▶ │ pve-backups/<nœud>/  │
-└─────────────┘              │ (en clair, effacé après) │  crypt  │   <noms chiffrés>    │
+│ 100 web     │ ───────────▶ │ vzdump-qemu-100-….vma.zst│ ──────▶ │ pve-backups/<node>/  │
+└─────────────┘              │ (plaintext, deleted after)│  crypt │  ….vma.zst.encrypted │
                              └─────────────────────────┘          └──────────────────────┘
 ```
 
-Pour chaque invité sélectionné :
+For each selected guest:
 
-1. `vzdump` crée l'archive (et son journal) dans un sous-dossier temporaire ;
-2. `rclone` l'envoie à travers un *remote* `crypt` : le fichier est chiffré
-   localement (XSalsa20-Poly1305, clé dérivée de la phrase secrète par scrypt),
-   OneDrive ne reçoit que des données et des noms illisibles ;
-3. `rclone cryptcheck` compare les sommes de contrôle locales et distantes ;
-4. le sous-dossier temporaire est effacé ;
-5. la rétention est appliquée à cet invité (les versions les plus anciennes
-   au-delà du nombre configuré sont supprimées).
+1. `vzdump` creates the archive (and its log) in a temporary subfolder;
+2. `rclone` uploads it through a `crypt` *remote*: the file is encrypted
+   locally (XSalsa20-Poly1305, key derived from the passphrase with scrypt),
+   so OneDrive only receives unreadable data;
+3. `rclone cryptcheck` compares the local and remote checksums;
+4. the temporary subfolder is deleted;
+5. retention is applied to that guest (the oldest versions beyond the
+   configured number are deleted).
 
-Une fois déchiffrée, l'arborescence distante ressemble à ceci :
+OneDrive shows this:
 
 ```
-pve-backups/<nœud>/
+pve-backups/<node>/
 ├── 100_web/
-│   ├── vzdump-qemu-100-2026_10_12-02_00_03.vma.zst
-│   └── vzdump-qemu-100-2026_10_12-02_00_03.log
+│   ├── vzdump-qemu-100-2026_10_12-02_00_03.vma.zst.encrypted
+│   └── vzdump-qemu-100-2026_10_12-02_00_03.log.encrypted
 └── 101_dns/
-    ├── vzdump-lxc-101-2026_10_12-02_04_41.tar.zst
-    └── vzdump-lxc-101-2026_10_12-02_04_41.log
+    ├── vzdump-lxc-101-2026_10_12-02_04_41.tar.zst.encrypted
+    └── vzdump-lxc-101-2026_10_12-02_04_41.log.encrypted
 ```
 
-Les archives sont des archives `vzdump` standard : une fois téléchargées et
-déchiffrées, elles se restaurent aussi avec `qmrestore` / `pct restore` ou
-l'interface web de Proxmox, sans cet outil.
+`vzdump` itself decides what goes into an archive, so Proxmox's per-disk
+backup setting is honoured: a VM disk with "Backup" unticked (`backup=0`) is
+left out, and a container mount point is only included if it has `backup=1`
+(the root disk always is). Disks left out are not in the archive and are
+therefore not restored.
 
-## Prérequis
+The archives are standard `vzdump` archives: once downloaded and decrypted,
+they can also be restored with `qmrestore` / `pct restore` or the Proxmox web
+interface, without this tool.
 
-- un nœud Proxmox VE (développé et testé sur PVE 9 / Debian 13), accès root ;
-- un compte Microsoft OneDrive (personnel ou professionnel) avec assez d'espace ;
-- un dossier local pouvant contenir temporairement la plus grosse archive ;
-- pour la première connexion : un ordinateur avec un navigateur web et
-  [rclone](https://rclone.org/downloads/) (Windows, macOS ou Linux).
+## Requirements
 
-Dépendances installées par `install.sh` si elles manquent : `rclone` (paquet
-officiel, celui de Debian étant trop ancien pour OneDrive), `jq`, `whiptail`, `curl`.
+- a Proxmox VE node (developed and tested on PVE 9 / Debian 13), root access;
+- a Microsoft OneDrive account (personal or business) with enough space;
+- a local folder that can temporarily hold the largest archive;
+- for the first connection: a computer with a web browser and
+  [rclone](https://rclone.org/downloads/) (Windows, macOS or Linux).
+
+Dependencies installed by `install.sh` if missing: `rclone` (official
+package, Debian's being too old for OneDrive), `jq`, `whiptail`, `curl`.
 
 ## Installation
 
@@ -97,148 +106,257 @@ cd onedrivepbs
 ./install.sh
 ```
 
-Le script copie l'outil dans `/usr/local/bin/onedrivepbs` et crée
-`/etc/onedrivepbs` (mode 700). Pour mettre à jour : `git pull && ./install.sh`.
-Pour retirer : `./install.sh --uninstall` (la configuration est conservée).
+The script copies the tool to `/usr/local/bin/onedrivepbs` and creates
+`/etc/onedrivepbs` (mode 700). To update: `git pull && ./install.sh`.
+To remove: `./install.sh --uninstall` (the configuration is kept).
 
-## Configuration initiale
+## Initial configuration
 
-Lancez `onedrivepbs` en root et ouvrez **Configuration**. Trois étapes.
+Run `onedrivepbs` as root and open **Configuration**. Three steps.
 
-### 1. Connexion OneDrive
+### 1. OneDrive connection
 
-Un serveur Proxmox n'a pas de navigateur : l'autorisation Microsoft se fait
-donc depuis un autre ordinateur, une seule fois.
+onedrivepbs reaches OneDrive through [rclone](https://rclone.org/). Microsoft
+only grants access through a sign-in page in a web browser, and a Proxmox
+server has none. The authorization is therefore performed **once, on another
+computer**, which produces a *token*; that token is then pasted into
+onedrivepbs on the server.
 
-1. Dans le menu : **Configuration → Connexion OneDrive → Assistant guidé**.
-2. Sur votre ordinateur (avec navigateur et rclone), exécutez :
-   ```
-   rclone authorize "onedrive"
-   ```
-3. Le navigateur s'ouvre : connectez-vous au compte Microsoft et acceptez
-   l'accès demandé par rclone.
-4. rclone affiche un long bloc de texte entre `--->` et `<---End paste`.
-   Copiez-le et collez-le dans l'assistant : les coupures de ligne ajoutées
-   par le terminal et les flèches copiées par mégarde sont ignorées, et un
-   jeton incomplet est redemandé. Si le collage pose problème, enregistrez ce
-   bloc dans un fichier sur le serveur et donnez le chemin du fichier à la
-   place.
-5. L'assistant pose ensuite les questions de rclone : type de compte
-   (choisissez `onedrive` pour un compte personnel ou professionnel), puis
-   confirmation du lecteur. Les lecteurs techniques de Microsoft sont
-   écartés ; le choix n'est proposé que s'il reste plusieurs lecteurs.
-6. Un test de connexion affiche l'espace total et libre du compte.
+```
+ Your computer (browser + rclone)                Proxmox server (onedrivepbs)
+ ────────────────────────────────                ────────────────────────────
+ rclone authorize "onedrive"
+   └─ browser: Microsoft sign-in, "Accept"
+   └─ terminal: prints the token   ──── copy / paste ────►  Token > …
+                                                            drive selection
+                                                            connection test
+```
 
-Le jeton obtenu est enregistré dans `/etc/onedrivepbs/rclone.conf` ; rclone le
-renouvelle automatiquement. Il ne faudra refaire cette étape que si l'accès est
-révoqué ou si le jeton reste inutilisé plus de 90 jours.
+#### Before you start
 
-Cas particuliers (bibliothèque SharePoint, application Azure propre…) : utilisez
-**Configuration rclone manuelle** et créez un remote nommé `onedrive`.
+- A computer with a web browser (Windows, macOS or Linux) on which you can
+  install rclone.
+- The Microsoft account that will hold the backups (personal, or work/school).
+- A terminal on the Proxmox server that accepts pasted text: an SSH session
+  is the most convenient. The Proxmox web console also works, but pasting a
+  long text into it is less reliable.
 
-### 2. Chiffrement
+#### Step 1 — Install rclone on your computer
 
-**Configuration → Chiffrement** propose de générer une phrase secrète aléatoire
-(recommandé) ou de saisir la vôtre.
+| System | Command |
+|---|---|
+| Windows | `winget install Rclone.Rclone`, or download the zip from <https://rclone.org/downloads/> and run `rclone.exe` from its folder |
+| macOS | `brew install rclone` |
+| Linux | `sudo -v ; curl https://rclone.org/install.sh \| sudo bash` |
 
-> **Notez cette phrase hors du serveur** (gestionnaire de mots de passe,
-> papier). Elle est indispensable pour restaurer si ce serveur est perdu.
-> Sans elle, les sauvegardes sont définitivement illisibles — personne, pas
-> même Microsoft, ne peut les déchiffrer.
+Prefer the same version as on the server; the authorization screen of
+onedrivepbs displays it (`rclone version` shows yours). Nothing has to be
+configured in rclone on your computer.
 
-Le même menu permet de réafficher la phrase plus tard, ou de la changer.
-Attention : les sauvegardes existantes restent chiffrées avec l'ancienne phrase.
+#### Step 2 — Start the guided configuration on the server
 
-### 3. Dossiers et options
+Run `onedrivepbs`, then **Configuration → OneDrive connection → Guided
+configuration**. The tool displays the instructions below and waits at the
+`Token >` prompt. Leave it there.
 
-| Réglage | Défaut | Rôle |
+#### Step 3 — Authorize on your computer
+
+In a terminal on your computer (PowerShell on Windows), run:
+
+```
+rclone authorize "onedrive"
+```
+
+Your browser opens on the Microsoft sign-in page; if it does not, open the
+`http://127.0.0.1:53682/auth…` address that rclone displays. Sign in with
+the account that will hold the backups and accept the permissions requested
+by rclone (read and write your files, and keep that access). The browser
+then shows **Success!** and can be closed.
+
+#### Step 4 — Copy the token to the server
+
+Back in the terminal of your computer, rclone has displayed:
+
+```
+Paste the following into your remote machine --->
+{"access_token":"EwB…","token_type":"Bearer","refresh_token":"M.C5…","expiry":"2026-…"}
+<---End paste
+```
+
+Copy the whole block between the two markers (it is one very long line,
+from `{` to `}`) and paste it at the `Token >` prompt on the server.
+
+- Line breaks added by the terminal, and the markers themselves if they were
+  copied too, are ignored.
+- An incomplete token is detected and asked for again.
+- If pasting does not work, save the block to a file, copy the file to the
+  server (`scp token.txt root@server:/root/`) and enter its path at the
+  prompt instead. Delete the file afterwards.
+- Pressing Enter on an empty line cancels; the previous connection, if any,
+  is kept.
+
+> The token gives access to the files of the account: treat it as a
+> password. Do not send it by e-mail or leave it in a file.
+
+#### Step 5 — Select the drive
+
+The tool then relays rclone's questions:
+
+1. the account type: choose `onedrive` for a personal or a work/school
+   OneDrive;
+2. the drive: Microsoft's technical drives are filtered out, and the question
+   is skipped when a single drive remains;
+3. a final confirmation showing the drive that was found.
+
+#### Step 6 — Connection test
+
+The tool ends with a test that displays the total and free space of the
+account. It can be run again at any time with **Configuration → Test the
+OneDrive connection**.
+
+The token is saved in `/etc/onedrivepbs/rclone.conf`, readable by root only,
+and rclone renews it automatically. The authorization only has to be redone
+if access is withdrawn or if the token goes unused for more than 90 days.
+
+Special cases (SharePoint library, your own Azure application…): choose
+**Manual rclone configuration** instead and create a remote named `onedrive`.
+
+#### Replacing or removing the connection
+
+Once a connection exists, **Configuration → OneDrive connection** offers:
+
+- **Replace the connection**: repeats the steps above, for instance to sign
+  in again or to use another account;
+- **Remove the connection from this server**: deletes the token stored in
+  `rclone.conf`. The backups on OneDrive and the encryption passphrase are
+  kept; scheduled backups fail until a connection is configured again.
+
+Removing the connection erases the token from the server, but the
+authorization granted to rclone stays registered with Microsoft. To withdraw
+it as well, remove `rclone` from the applications authorized on the account:
+
+- personal account: <https://account.microsoft.com/privacy/app-access>;
+- work or school account: <https://myapps.microsoft.com>.
+
+Withdrawing it there invalidates every rclone token of that account,
+including the one used by another server.
+
+### 2. Encryption
+
+**Configuration → Encryption** offers to generate a random passphrase
+(recommended) or to enter your own.
+
+> **Write this passphrase down off the server** (password manager, paper).
+> It is required to restore if this server is lost. Without it, the backups
+> are permanently unreadable — nobody, not even Microsoft, can decrypt them.
+
+The same menu lets you display the passphrase again later, or change it.
+Note: existing backups remain encrypted with the old passphrase.
+
+#### File names
+
+rclone's `crypt` encrypts the contents of every file (XSalsa20-Poly1305,
+256-bit key). The names are left as they are, followed by `.encrypted`, so
+the OneDrive folder stays easy to browse:
+`100_web/vzdump-qemu-100-….vma.zst.encrypted`. Guest IDs, guest names,
+backup dates, file sizes and upload dates are therefore visible to anyone
+with access to the OneDrive account.
+
+An installation made with an earlier version, which could encrypt the names,
+is detected when the menus open: the tool offers to rename the existing
+backups in place, without uploading them again.
+
+### 3. Folders and options
+
+| Setting | Default | Purpose |
 |---|---|---|
-| Dossier OneDrive | `pve-backups/<nœud>` | Emplacement des sauvegardes dans OneDrive |
-| Dossier temporaire local | `/var/lib/vz/dump` | Où `vzdump` écrit l'archive avant l'envoi. Choisissez un stockage avec assez d'espace libre |
-| Mode vzdump | `snapshot` | `snapshot` (sans interruption), `suspend` ou `stop` |
-| Compression | `zstd` | `zstd`, `gzip`, `lzo` ou aucune |
-| Limite de débit | aucune | Par ex. `10M` pour ne pas saturer la connexion |
-| Vérification après envoi | oui | Comparaison des sommes de contrôle |
+| OneDrive folder | `pve-backups/<node>` | Where the backups live in OneDrive |
+| Local staging folder | `/var/lib/vz/dump` | Where `vzdump` writes the archive before upload. Pick a storage with enough free space |
+| vzdump mode | `snapshot` | `snapshot` (no downtime), `suspend` or `stop` |
+| Compression | `zstd` | `zstd`, `gzip`, `lzo` or none |
+| Upload rate limit | none | E.g. `10M` to avoid saturating the connection |
+| Verify after upload | yes | Checksum comparison |
 
-## Sauvegarder
+## Backing up
 
-Menu **1 – Sauvegarder des VM / conteneurs** : cochez les invités (barre
-d'espace), validez. La progression de `vzdump` puis de l'envoi s'affiche dans
-le terminal. Un échec sur un invité n'empêche pas les suivants ; le résumé
-final indique le nombre de réussites.
+Menu **1 – Back up virtual machines and containers**: select the guests (space bar),
+confirm. `vzdump` and then the upload each show a progress bar in the
+terminal (percentage, size, speed, time). A container archive reports no
+percentage, so the size written so far is shown instead. A failure on one guest does not stop the following ones; the final
+summary gives the number of successes.
 
-Conseil : lancez l'outil dans `tmux` ou `screen` pour les grosses sauvegardes,
-afin qu'une coupure SSH n'interrompe pas l'envoi.
+Tip: run the tool inside `tmux` or `screen` for large backups, so that a
+dropped SSH session does not interrupt the upload.
 
-## Gérer les sauvegardes sur OneDrive
+## Managing backups on OneDrive
 
-Menu **3 – Gérer les sauvegardes sur OneDrive** :
+Menu **3 – Manage the backups on OneDrive**:
 
-| Entrée | Effet |
+| Entry | Effect |
 |---|---|
-| Lister les sauvegardes | ID, type, nom, date et taille de chaque sauvegarde, et total |
-| Supprimer des sauvegardes | Suppression de celles que vous cochez (avec confirmation) |
-| Versions conservées (rétention) | Nombre de versions gardées par invité : valeur par défaut, et valeur propre à un invité |
-| Appliquer la rétention maintenant | Purge immédiate selon les réglages |
-| Espace utilisé sur OneDrive | Quota du compte |
+| List the backups | ID, type, name, date and size of each backup, and the total |
+| Delete backups | Deletes the ones you select (with confirmation) |
+| Retention policy | Number of versions kept per guest: default value, and per-guest value |
+| Apply the retention policy now | Immediate pruning according to the settings |
+| Storage used on OneDrive | Account quota |
 
-Règles de rétention :
+Retention rules:
 
-- la valeur par défaut est **3** versions par invité ;
-- une valeur propre à un invité remplace la valeur par défaut pour cet invité ;
-- **0** signifie « tout conserver » ;
-- la rétention s'applique automatiquement après chaque sauvegarde réussie de
-  l'invité concerné, jamais après un échec ;
-- les fichiers supprimés passent par la corbeille OneDrive (toujours chiffrés)
-  et continuent d'occuper le quota jusqu'à ce qu'elle soit vidée.
+- the default is **3** versions per guest;
+- a per-guest value overrides the default for that guest;
+- **0** means "keep everything";
+- retention is applied automatically after each successful backup of the
+  guest concerned, never after a failure;
+- deleted files go through the OneDrive recycle bin (still encrypted) and
+  keep counting against the quota until it is emptied.
 
-## Restaurer
+## Restoring
 
-Menu **2 – Restaurer une sauvegarde** : choisissez la sauvegarde, puis :
+Menu **2 – Restore a backup**: choose the backup, then:
 
-| Choix | Effet |
+| Choice | Effect |
 |---|---|
-| Restaurer sous l'ID d'origine | Recrée l'invité. S'il existe déjà, il est **écrasé** après confirmation (il doit être arrêté) |
-| Restaurer sous un nouvel ID | Crée une copie ; l'outil propose le prochain ID libre et de nouvelles adresses MAC |
-| Télécharger seulement | Dépose l'archive déchiffrée dans le dossier indiqué, sans restaurer |
+| Restore under the original ID | Recreates the guest. If it already exists, it is **overwritten** after confirmation (it must be stopped) |
+| Restore under a new ID | Creates a copy; the tool suggests the next free ID and new MAC addresses |
+| Download the decrypted archive only | Puts the decrypted archive in the given folder, without restoring |
 
-L'outil demande ensuite le stockage de destination des disques, télécharge et
-déchiffre l'archive dans le dossier temporaire, lance `qmrestore` (VM) ou
-`pct restore` (conteneur), puis efface l'archive temporaire.
+The tool then asks for the target storage for the disks, downloads and
+decrypts the archive into the staging folder, runs `qmrestore` (VM) or
+`pct restore` (container), then deletes the temporary archive.
 
-Après une restauration sous un nouvel ID, pensez à vérifier l'adresse IP et le
-nom d'hôte avant de démarrer la copie si l'original tourne encore.
+After restoring under a new ID, remember to check the IP address and host
+name before starting the copy if the original is still running.
 
-## Reprise après sinistre (serveur perdu)
+## Disaster recovery (server lost)
 
-Il vous faut : l'accès au compte OneDrive et la **phrase secrète**.
+You need: access to the OneDrive account and the **passphrase**.
 
-1. Installez Proxmox VE sur le nouveau serveur, puis onedrivepbs (`./install.sh`).
-2. **Configuration → Connexion OneDrive** : refaites l'autorisation.
-3. **Configuration → Dossier OneDrive** : indiquez le dossier de l'ancien
-   serveur, par ex. `pve-backups/ancien-nom` (le défaut utilise le nom du
-   nouveau nœud).
-4. **Configuration → Chiffrement → Saisir ma propre phrase** : entrez la phrase
-   secrète d'origine.
-5. **Gérer → Lister** : les sauvegardes doivent apparaître. Si la liste est
-   vide alors que le dossier contient des fichiers, la phrase ou le dossier
-   est incorrect.
-6. **Restaurer** chaque invité.
+1. Install Proxmox VE on the new server, then onedrivepbs (`./install.sh`).
+2. **Configuration → OneDrive connection**: redo the authorization.
+3. **Configuration → OneDrive folder**: enter the old server's folder, e.g.
+   `pve-backups/old-name` (the default uses the new node's name).
+4. **Configuration → Encryption → Enter a passphrase**: enter the
+   original passphrase.
+5. **Manage → List the backups**: the backups should appear. If the list is
+   empty although the folder contains files, the passphrase or the folder
+   is wrong.
+6. **Restore** each guest.
 
-Sans cet outil, avec n'importe quel rclone, la même chose à la main :
+Without this tool, with any rclone, the same thing by hand:
 
 ```ini
 # rclone.conf
 [onedrive]
 type = onedrive
-# … créé par « rclone config »
+# … created by "rclone config"
 
 [onedrive-crypt]
 type = crypt
-remote = onedrive:pve-backups/<nœud>
-password = <résultat de : rclone obscure 'votre phrase secrète'>
-filename_encryption = standard
-directory_name_encryption = true
+remote = onedrive:pve-backups/<node>
+password = <output of: rclone obscure 'your passphrase'>
+filename_encryption = off
+directory_name_encryption = false
+suffix = .encrypted
 ```
 
 ```bash
@@ -247,93 +365,110 @@ rclone copy onedrive-crypt:100_web/vzdump-qemu-100-….vma.zst /var/lib/vz/dump/
 qmrestore /var/lib/vz/dump/vzdump-qemu-100-….vma.zst 100 --storage local-lvm
 ```
 
-**Testez une restauration** (sous un nouvel ID) de temps en temps : une
-sauvegarde jamais restaurée n'est qu'un espoir.
+**Test a restore** (under a new ID) from time to time: a backup that has
+never been restored is only a hope.
 
-## Planification et ligne de commande
+## Scheduling and command line
 
-Menu **4 – Planification automatique** : quotidienne ou hebdomadaire, heure de
-lancement, tous les invités ou une sélection. L'outil écrit
-`/etc/cron.d/onedrivepbs` ; « Désactiver » le supprime.
+Menu **4 – Automatic scheduling** lists the schedules and lets you add or
+remove them. Selecting a schedule also offers **Run this schedule now**,
+which backs up its guests immediately, with the progress on screen, without
+changing the schedule. Several schedules can coexist, for instance a daily one for a
+critical guest and a weekly one for everything. Each schedule defines:
 
-Sous-commandes utilisables dans vos propres scripts :
+- the destination, among those that are configured (the question is skipped
+  while OneDrive is the only one);
+- the frequency: daily, or weekly on a given day;
+- the start time (HH:MM);
+- the guests: either **all guests on the node**, which includes those added
+  later, or **a selection** of guests.
+
+The schedules are stored in `/etc/cron.d/onedrivepbs`, one line each. A
+schedule that starts while another backup is still running waits for its
+turn (up to 12 hours).
+
+Subcommands you can use in your own scripts:
 
 ```
-onedrivepbs backup --all       # tous les invités du nœud
-onedrivepbs backup 100 101     # invités précis
-onedrivepbs list               # sauvegardes présentes sur OneDrive
-onedrivepbs prune              # applique la rétention
+onedrivepbs backup --all       # every guest on the node
+onedrivepbs backup 100 101     # specific guests
+onedrivepbs backup --to onedrive --all   # explicit destination
+onedrivepbs list               # backups stored on OneDrive
+onedrivepbs prune              # apply retention
 ```
 
-`backup` renvoie le nombre d'échecs comme code de retour (0 = tout a réussi).
-Un verrou empêche deux opérations simultanées.
+`backup` returns the number of failures as its exit status (0 = everything
+succeeded). A lock prevents two operations from running at the same time:
+`backup` waits for the operation in progress, the other subcommands give up.
 
-## Fichiers et sécurité
+## Files and security
 
-| Fichier | Contenu | Droits |
+| File | Contents | Permissions |
 |---|---|---|
-| `/usr/local/bin/onedrivepbs` | L'outil | 755 |
-| `/etc/onedrivepbs/rclone.conf` | **Jeton OneDrive et phrase secrète** | 600, dossier 700 |
-| `/etc/onedrivepbs/config` | Réglages (aucun secret) | 600 |
-| `/etc/cron.d/onedrivepbs` | Planification | 644 |
-| `/var/log/onedrivepbs.log` | Journal des opérations | — |
+| `/usr/local/bin/onedrivepbs` | The tool | 755 |
+| `/etc/onedrivepbs/rclone.conf` | **OneDrive token and passphrase** | 600, folder 700 |
+| `/etc/onedrivepbs/config` | Settings (no secrets) | 600 |
+| `/etc/cron.d/onedrivepbs` | Schedule | 644 |
+| `/var/log/onedrivepbs.log` | Operations log | — |
 
-À savoir :
+Good to know:
 
-- Dans `rclone.conf`, la phrase secrète est seulement *obscurcie* par rclone,
-  pas chiffrée : quiconque lit ce fichier peut déchiffrer les sauvegardes et
-  accéder au OneDrive. Il n'est lisible que par root ; ne le copiez pas
-  ailleurs sans protection et ne le versionnez jamais.
-- Le chiffrement protège vos données vis-à-vis de OneDrive et de quiconque
-  accéderait au compte. Il ne protège pas contre quelqu'un qui est root sur le
-  serveur Proxmox.
-- Pendant une sauvegarde ou une restauration, l'archive existe **en clair**
-  dans le dossier temporaire local ; elle est effacée dès la fin de
-  l'opération, y compris en cas d'erreur ou d'interruption.
-- La taille des fichiers et la date d'envoi restent visibles côté OneDrive.
-- Ce dépôt ne contient ni identifiant, ni jeton, ni phrase secrète : tout cela
-  vit uniquement dans `/etc/onedrivepbs`, et le `.gitignore` exclut ces fichiers.
+- In `rclone.conf`, the passphrase is only *obscured* by rclone, not
+  encrypted: anyone who reads that file can decrypt the backups and access
+  the OneDrive. It is readable by root only; do not copy it elsewhere
+  unprotected and never commit it.
+- Encryption protects your data from OneDrive and from anyone who gains
+  access to the account. It does not protect against someone who is root on
+  the Proxmox server.
+- During a backup or a restore, the archive exists **in plaintext** in the
+  local staging folder; it is deleted as soon as the operation ends,
+  including on error or interruption.
+- File names (guest IDs and names, backup dates), sizes and upload dates
+  remain visible on the OneDrive side; only the contents are encrypted.
+- This repository contains no credentials, token or passphrase: all of that
+  lives only in `/etc/onedrivepbs`, and the `.gitignore` excludes those files.
 
-## Dépannage
+## Troubleshooting
 
-| Symptôme | Piste |
+| Symptom | What to try |
 |---|---|
-| « OneDrive et/ou le chiffrement ne sont pas encore configurés » | Terminer les étapes 1 et 2 de la configuration |
-| Le jeton collé est refusé | Utiliser la même version de rclone des deux côtés ; coller sur une seule ligne, ou passer par un fichier |
-| Échec du test de connexion après quelques mois | Jeton expiré ou révoqué : refaire **Connexion OneDrive** |
-| `vzdump` échoue faute de place | Changer le **dossier temporaire local** pour un stockage plus grand |
-| Envoi très lent ou erreurs 429 | Microsoft limite le débit ; rclone réessaie seul. Éviter les heures de pointe |
-| Liste vide alors que OneDrive contient des fichiers | Mauvaise phrase secrète ou mauvais **dossier OneDrive** |
-| « Une autre opération onedrivepbs est déjà en cours » | Attendre la fin de la sauvegarde planifiée, ou vérifier avec `ps aux \| grep onedrivepbs` |
-| La restauration sous l'ID d'origine échoue | L'invité existant doit être arrêté et non verrouillé |
+| "The OneDrive connection and the encryption must be configured…" | Complete steps 1 and 2 of the configuration |
+| The pasted token is rejected | Use the same rclone version on both sides; paste it on a single line, or go through a file |
+| Connection test fails after a few months | Token expired or revoked: redo **OneDrive connection** |
+| `vzdump` fails for lack of space | Change the **local staging folder** to a larger storage |
+| Very slow upload or 429 errors | Microsoft is throttling; rclone retries by itself. Avoid peak hours |
+| Empty list although OneDrive contains files | Wrong passphrase or wrong **OneDrive folder** |
+| "Another onedrivepbs operation is already in progress" | Wait for the scheduled backup to finish, or check with `ps aux \| grep onedrivepbs` |
+| Restoring under the original ID fails | The existing guest must be stopped and not locked |
 
-Le détail de chaque opération (sorties de `vzdump` et de `rclone`) est dans
-`/var/log/onedrivepbs.log`, consultable aussi par le menu **Journal**.
+The details of each operation (`vzdump` and `rclone` output) are in
+`/var/log/onedrivepbs.log`, also viewable through the **Log** menu.
 
-## Limites connues
+## Known limitations
 
-- Un seul nœud à la fois : l'outil sauvegarde les invités du nœud où il tourne.
-- Sauvegardes complètes uniquement (pas d'incrémental ni de déduplication) :
-  chaque version occupe sa taille compressée entière sur OneDrive.
-- Taille maximale d'un fichier sur OneDrive : 250 Go par archive.
-- Il faut localement l'espace de l'archive compressée, à la sauvegarde comme
-  à la restauration.
-- La restauration n'existe que dans les menus (pas de sous-commande).
+- One node at a time: the tool backs up the guests of the node it runs on.
+- Full backups only (no incremental, no deduplication): each version takes
+  its whole compressed size on OneDrive.
+- Maximum file size on OneDrive: 250 GB per archive.
+- Local space for the compressed archive is needed, for backup as well as
+  for restore.
+- Restore only exists in the menus (no subcommand).
+- The interface is in English only for now.
 
-## Développement et tests
+## Development and testing
 
-Le script passe `shellcheck` sans avertissement. Pour essayer l'outil sans
-toucher à la configuration réelle ni à un vrai compte OneDrive, on peut
-rediriger ses fichiers et utiliser un dossier local comme faux OneDrive :
+The script passes `shellcheck` with no warnings. To try the tool without
+touching the real configuration or a real OneDrive account, you can redirect
+its files and use a local folder as a fake OneDrive:
 
 ```bash
 export ONEDRIVEPBS_CONF_DIR=/tmp/odp/conf ONEDRIVEPBS_LOG=/tmp/odp/log \
        ONEDRIVEPBS_LOCK=/tmp/odp/lock ONEDRIVEPBS_CRON=/tmp/odp/cron
-mkdir -p /tmp/odp/conf /tmp/odp/faux-onedrive
-printf '[onedrive]\ntype = alias\nremote = /tmp/odp/faux-onedrive\n' > /tmp/odp/conf/rclone.conf
-./onedrivepbs      # puis Configuration → Chiffrement, et une sauvegarde d'essai
+mkdir -p /tmp/odp/conf /tmp/odp/fake-onedrive
+printf '[onedrive]\ntype = alias\nremote = /tmp/odp/fake-onedrive\n' > /tmp/odp/conf/rclone.conf
+./onedrivepbs      # then Configuration → Encryption, and a trial backup
 ```
 
-## Licence
+## License
 
-MIT — voir [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

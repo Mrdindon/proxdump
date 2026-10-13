@@ -1,6 +1,6 @@
-# Rien de ce qui suit ne doit jamais être versionné : secrets et données.
+# Nothing below must ever be committed: secrets and data.
 
-# Configuration et secrets (jeton OAuth OneDrive, phrase secrète de chiffrement)
+# Configuration and secrets (OneDrive OAuth token, encryption passphrase)
 rclone.conf
 rclone.conf.*
 *.conf.bak
@@ -12,7 +12,7 @@ rclone.conf.*
 *.key
 *.pem
 
-# Archives de sauvegarde
+# Backup archives
 *.vma
 *.vma.*
 *.tar.zst
@@ -20,11 +20,11 @@ rclone.conf.*
 *.tar.lzo
 dump/
 
-# Journaux et fichiers temporaires
+# Logs and temporary files
 *.log
 *.lock
 *.tmp
 onedrivepbs.*/
 
-# Outils locaux
+# Local tooling
 .claude/
