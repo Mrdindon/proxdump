@@ -28,9 +28,62 @@ VZDUMP_MODE="snapshot"            # snapshot | suspend | stop
 COMPRESS="zstd"                   # zstd | gzip | lzo | 0
 BWLIMIT=""                        # rclone rate limit (e.g. 10M), empty = none
 VERIFY=1                          # verify checksums after upload
+UI_LANG=""                        # interface language; empty = that of the system
 declare -A KEEP_BY_ID=()          # per-guest retention: KEEP_BY_ID[100]=5
 
 CLEANUP_DIRS=()
+
+# --- Languages ---------------------------------------------------------------
+# English is the source language: every message is written in English in
+# this file, and looked up in the catalogue of the selected language
+# ($LANG_DIR/<code>.sh, one "_m 'English' 'translation'" line per message).
+# A message without translation is displayed in English. In a message, {1},
+# {2}… stand for the arguments.
+LANG_CODES=(en fr es de zh ru)
+declare -A LANG_NAMES=([en]="English" [fr]="Français" [es]="Español"
+    [de]="Deutsch" [zh]="中文" [ru]="Русский")
+LANG_DIR="${PROXDUMP_LANG_DIR:-}"
+if [[ -z $LANG_DIR ]]; then
+    LANG_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lang"
+    [[ -d $LANG_DIR ]] || LANG_DIR=/usr/local/share/proxdump/lang
+fi
+CUR_LANG=en
+declare -A T=()
+_m() { T[$1]=$2; }
+
+# Accented, Cyrillic and Chinese characters need a UTF-8 terminal
+[[ $(locale charmap 2>/dev/null) == UTF-8 ]] || export LC_ALL=C.UTF-8
+
+t() { # message, arguments
+    local s=$1 i=1 a
+    [[ -n $s && -n ${T[$s]:-} ]] && s=${T[$s]}
+    shift
+    for a; do
+        s=${s//"{$i}"/"$a"}
+        i=$((i + 1))
+    done
+    printf '%s\n' "$s"
+}
+
+# Selects the language: PROXDUMP_LANG, else the configuration, else the system
+load_language() {
+    local code=${PROXDUMP_LANG:-$UI_LANG}
+    if [[ -z $code ]]; then
+        code=${LC_MESSAGES:-${LANG:-en}}
+        code=${code%%[_.@]*}
+    fi
+    T=()
+    CUR_LANG=en
+    if [[ $code != en && -r $LANG_DIR/$code.sh ]]; then
+        # shellcheck disable=SC1090
+        source "$LANG_DIR/$code.sh"
+        CUR_LANG=$code
+    fi
+    BTN_OK=(--ok-button "$(t "Ok")")
+    BTN_CANCEL=(--cancel-button "$(t "Cancel")")
+    BTN_YN=(--yes-button "$(t "Yes")" --no-button "$(t "No")")
+}
+BTN_OK=() BTN_CANCEL=() BTN_YN=()
 UI=0 # 1 while an operation started from the menus runs behind a gauge
 
 # --- Destinations ------------------------------------------------------------
@@ -45,6 +98,7 @@ declare -A DEST_TYPES=([onedrive]=onedrive [gdrive]=drive
 declare -A DEST_VENDORS=([onedrive]=Microsoft [gdrive]=Google [dropbox]=Dropbox)
 # destinations whose token lapses when it stays unused, and after how long
 declare -A DEST_TOKEN_LIFE=([onedrive]="90 days" [gdrive]="6 months")
+# i18n: "S3 storage" "SFTP server" "90 days" "6 months"
 # where REMOTE_DIR lives on destinations that have no root of their own:
 # the bucket (s3) or a folder of the server (sftp). Saved in $CONF_FILE.
 declare -A DEST_ROOT=()
@@ -56,9 +110,8 @@ use_dest() {
     DEST=$1
     BASE_REMOTE=$1
     CRYPT_REMOTE="$1-crypt"
-    DEST_NAME=${DEST_NAMES[$1]:-$1}
+    DEST_NAME=$(t "${DEST_NAMES[$1]:-$1}")
 }
-use_dest onedrive
 
 # 'remote:path' of the folder that holds the backups of a destination
 dest_base() { # id
@@ -91,12 +144,13 @@ cleanup() {
     done
 }
 trap cleanup EXIT
-trap 'ui_abort; echo; log "Interrupted."; exit 130' INT TERM
+trap 'ui_abort; echo; log "$(t "Interrupted.")"; exit 130' INT TERM
 
 load_config() {
     # shellcheck disable=SC1090
     [[ -r $CONF_FILE ]] && source "$CONF_FILE"
     # earlier versions saved the remote names; they now follow the destination
+    load_language
     use_dest onedrive
     return 0
 }
@@ -107,7 +161,7 @@ save_config() {
     {
         echo "# proxdump — generated automatically, contains no secrets"
         for v in REMOTE_DIR STAGING_DIR KEEP_DEFAULT \
-                 VZDUMP_MODE COMPRESS BWLIMIT VERIFY; do
+                 VZDUMP_MODE COMPRESS BWLIMIT VERIFY UI_LANG; do
             printf '%s=%q\n' "$v" "${!v}"
         done
         for id in "${!KEEP_BY_ID[@]}"; do
@@ -126,7 +180,7 @@ check_deps() {
     for c in whiptail rclone jq vzdump pvesh qmrestore pct flock numfmt; do
         command -v "$c" >/dev/null || missing+=("$c")
     done
-    ((${#missing[@]} == 0)) || die "missing commands: ${missing[*]} (run install.sh)"
+    ((${#missing[@]} == 0)) || die "$(t "missing commands: {1} (run install.sh)" "${missing[*]}")"
 }
 
 LOCK_WAIT=0 # seconds to wait for a running operation (0 = give up at once)
@@ -135,10 +189,10 @@ acquire_lock() {
     exec 9>"$LOCK_FILE"
     flock -n 9 && return 0
     if ((LOCK_WAIT > 0)); then
-        log "Another proxdump operation is in progress; waiting for it to finish (up to $(human_duration "$LOCK_WAIT"))."
+        log "$(t "Another proxdump operation is in progress; waiting for it to finish (up to {1})." "$(human_duration "$LOCK_WAIT")")"
         flock -w "$LOCK_WAIT" 9 && return 0
     fi
-    log "Another proxdump operation is already in progress."
+    log "$(t "Another proxdump operation is already in progress.")"
     return 1
 }
 
@@ -161,7 +215,7 @@ dest_list() {
     remotes=$(rclone listremotes 2>/dev/null)
     for id in "${DEST_IDS[@]}"; do
         grep -qxF "$id:" <<<"$remotes" && grep -qxF "$id-crypt:" <<<"$remotes" &&
-            printf '%s\t%s\n' "$id" "${DEST_NAMES[$id]}"
+            printf '%s\t%s\n' "$id" "$(t "${DEST_NAMES[$id]}")"
     done
     # the status of the last test must not become that of the function:
     # callers read it through pipelines, under 'pipefail'
@@ -174,10 +228,11 @@ dest_ready() { # id
 
 # 'onedrive,gdrive' -> 'OneDrive and Google Drive'; empty = whatever is configured
 dest_label() {
-    local id out=""
-    [[ -n $1 ]] || { echo "every configured destination"; return; }
+    local id name out=""
+    [[ -n $1 ]] || { t "every configured destination"; return; }
     for id in ${1//,/ }; do
-        out+="${out:+ and }${DEST_NAMES[$id]:-$id}"
+        name=$(t "${DEST_NAMES[$id]:-$id}")
+        if [[ -n $out ]]; then out=$(t "{1} and {2}" "$out" "$name"); else out=$name; fi
     done
     echo "$out"
 }
@@ -189,11 +244,11 @@ set_dests() {
     DESTS=()
     if [[ -z $1 ]]; then
         mapfile -t DESTS < <(dest_list | cut -f1)
-        ((${#DESTS[@]})) || { echo "no destination is configured"; return 1; }
+        ((${#DESTS[@]})) || { t "no destination is configured"; return 1; }
         return 0
     fi
     for id in ${1//,/ }; do
-        dest_ready "$id" || { echo "destination '$id' is unknown or not configured"; return 1; }
+        dest_ready "$id" || { t "destination '{1}' is unknown or not configured" "$id"; return 1; }
         DESTS+=("$id")
     done
 }
@@ -230,6 +285,8 @@ human_duration() { # seconds -> 1h02m, 3m04s, 5s
 # a line of details.
 gauge() { # percentage, details
     local w=$((W - 4))
+    # Chinese characters are two columns wide
+    [[ $CUR_LANG == zh ]] && w=$((w / 2))
     printf 'XXX\n%s\n%s\n\n%s\n%s\nXXX\n' "$1" "${G_HEAD:0:w}" "${G_STEP:0:w}" "${2:0:w}" 2>/dev/null >&8
 }
 gauge_step() {
@@ -271,7 +328,7 @@ run_quiet() { # command…
     "$@" &
     pid=$!
     while kill -0 "$pid" 2>/dev/null; do
-        gauge 0 "$(human_duration $((SECONDS - start))) elapsed"
+        gauge 0 "$(t "{1} elapsed" "$(human_duration $((SECONDS - start)))")"
         sleep 1
     done
     wait "$pid"
@@ -295,7 +352,7 @@ run_logged() { # folder to watch (or ""), command…
         if ((rc > 128)); then # nothing new for 2 s
             part+=$line
             if ((!bar)) && [[ -n $dir ]]; then
-                progress_note "In progress: $(human_size "$(du -sb "$dir" 2>/dev/null | cut -f1)") written, $(human_duration $((SECONDS - start))) elapsed"
+                progress_note "$(t "In progress: {1} written, {2} elapsed" "$(human_size "$(du -sb "$dir" 2>/dev/null | cut -f1)")" "$(human_duration $((SECONDS - start)))")"
             fi
             continue
         fi
@@ -350,7 +407,7 @@ rclone_copy() { # source, destination
         while IFS=$'\x1f' read -r kind a b c d; do
             if [[ $kind == S ]]; then
                 ((b > 0)) && progress_bar $((a * 100 / b)) \
-                    "$(human_size "$a") / $(human_size "$b")  $(human_size "$c")/s  ETA $(human_duration "$d")"
+                    "$(t "{1} / {2}  {3}/s  remaining: {4}" "$(human_size "$a")" "$(human_size "$b")" "$(human_size "$c")" "$(human_duration "$d")")"
             else
                 echo "$(date '+%F %T') rclone $a: $b${c:+ ($c)}" >>"$LOG_FILE"
                 if [[ $a == error ]]; then
@@ -440,16 +497,16 @@ prune_remote() {
         n=$((n + 1))
         keep=$(keep_for "$id")
         ((keep > 0 && n > keep)) || continue
-        log "Retention ($keep version(s) for $id): deleting $path"
+        log "$(t "Retention ({1} version(s) for {2}): deleting {3}" "$keep" "$id" "$path")"
         if delete_backup "$path"; then
             deleted=$((deleted + 1))
         else
-            log "ERROR: could not delete $path"
+            log "ERROR: $(t "could not delete {1}" "$path")"
         fi
     done < <(remote_list)
     ((deleted > 0)) && rclone rmdirs "$CRYPT_REMOTE:" --leave-root 2>>"$LOG_FILE"
     # after a backup, only worth a line when something was deleted
-    [[ -n $only ]] && ((deleted == 0)) || log "Retention: $deleted backup(s) deleted."
+    [[ -n $only ]] && ((deleted == 0)) || log "$(t "Retention: {1} backup(s) deleted." "$deleted")"
 }
 
 # --- Backup ------------------------------------------------------------------
@@ -459,10 +516,10 @@ prune_remote() {
 # commands only allows the sizes to be compared.
 verify_upload() { # local folder, crypt path
     if rclone backend features "$BASE_REMOTE:" 2>/dev/null | jq -e '.Hashes | length > 0' >/dev/null; then
-        log "Verifying checksums (re-reads the local archive)…"
+        log "$(t "Verifying checksums (re-reads the local archive)…")"
         run_quiet rclone cryptcheck "$1" "$2" --one-way --log-file "$LOG_FILE" --log-level NOTICE
     else
-        log "Verifying sizes ($DEST_NAME provides no checksums)…"
+        log "$(t "Verifying sizes ({1} provides no checksums)…" "$DEST_NAME")"
         run_quiet rclone check "$1" "$2" --one-way --size-only --log-file "$LOG_FILE" --log-level NOTICE
     fi
 }
@@ -473,20 +530,20 @@ backup_guest() { # vmid type name
     dest="${id}_${safe:-guest}"
 
     [[ -d $STAGING_DIR && -w $STAGING_DIR ]] ||
-        { log "ERROR: staging folder $STAGING_DIR is not usable"; return 1; }
+        { log "ERROR: $(t "staging folder {1} is not usable" "$STAGING_DIR")"; return 1; }
     tmp=$(mktemp -d "$STAGING_DIR/proxdump.XXXXXX") || return 1
     CLEANUP_DIRS+=("$tmp")
     # an unprivileged container is archived by a shifted uid, which must be
     # able to traverse the folder (without being able to list its contents)
     chmod 711 "$tmp"
 
-    log "=== Backing up $type $id ($name) ==="
-    ((UI)) && gauge_step "Creating the archive (vzdump, $VZDUMP_MODE mode)…"
+    log "=== $(t "Backing up {1} {2} ({3})" "$type" "$id" "$name") ==="
+    ((UI)) && gauge_step "$(t "Creating the archive (vzdump, {1} mode)…" "$VZDUMP_MODE")"
     run_logged "$tmp" vzdump "$id" --dumpdir "$tmp" --mode "$VZDUMP_MODE" --compress "$COMPRESS"
     rc=$?
     archive=$(find "$tmp" -maxdepth 1 -type f \( -name 'vzdump-*.vma*' -o -name 'vzdump-*.tar*' \) | head -n1)
     if ((rc != 0)) || [[ -z $archive ]]; then
-        log "ERROR: vzdump failed for $id (exit code $rc)"
+        log "ERROR: $(t "vzdump failed for {1} (exit code {2})" "$id" "$rc")"
         rm -rf -- "$tmp"
         return 1
     fi
@@ -494,20 +551,20 @@ backup_guest() { # vmid type name
     # one archive, uploaded to each destination in turn
     for d in "${DESTS[@]}"; do
         use_dest "$d"
-        log "Encrypted upload of $(basename "$archive") ($(human_size "$(stat -c %s "$archive")")) to $DEST_NAME…"
+        log "$(t "Encrypted upload of {1} ({2}) to {3}…" "$(basename "$archive")" "$(human_size "$(stat -c %s "$archive")")" "$DEST_NAME")"
         if ! rclone_copy "$tmp" "$CRYPT_REMOTE:$dest"; then
-            log "ERROR: upload to $DEST_NAME failed for $id"
+            log "ERROR: $(t "upload to {1} failed for {2}" "$DEST_NAME" "$id")"
             rc=1
             continue
         fi
         if [[ $VERIFY == 1 ]]; then
             if ! verify_upload "$tmp" "$CRYPT_REMOTE:$dest"; then
-                log "ERROR: verification failed for $id — the copy on $DEST_NAME cannot be trusted"
+                log "ERROR: $(t "verification failed for {1} — the copy on {2} cannot be trusted" "$id" "$DEST_NAME")"
                 rc=1
                 continue
             fi
         fi
-        log "Backup of $id to $DEST_NAME complete."
+        log "$(t "Backup of {1} to {2} complete." "$id" "$DEST_NAME")"
         prune_remote "$id"
     done
     rm -rf -- "$tmp"
@@ -518,9 +575,9 @@ backup_guest() { # vmid type name
 # exit status = number of failures
 backup_guests() { # vmid…
     local id type name status failed=0 found guests n=0
-    ((${#DESTS[@]})) || { log "ERROR: no destination is configured"; return 1; }
+    ((${#DESTS[@]})) || { log "ERROR: $(t "no destination is configured")"; return 1; }
     for id in "${DESTS[@]}"; do
-        dest_ready "$id" || { log "ERROR: destination '$id' is not configured"; return 1; }
+        dest_ready "$id" || { log "ERROR: $(t "destination '{1}' is not configured" "$id")"; return 1; }
     done
     acquire_lock || return 1
     guests=$(guest_list)
@@ -530,15 +587,16 @@ backup_guests() { # vmid…
             if [[ $gid == "$id" ]]; then
                 found=1
                 n=$((n + 1))
-                G_HEAD="Backup $n of $#: $type $id ($name)"
+                G_HEAD=$(t "Backup {1} of {2}: {3} {4} ({5})" "$n" "$#" "$type" "$id" "$name")
                 backup_guest "$id" "$type" "$name" </dev/null || failed=$((failed + 1))
                 break
             fi
         done <<<"$guests"
-        ((found)) || { log "ERROR: guest $id not found on this node"; failed=$((failed + 1)); }
+        ((found)) || { log "ERROR: $(t "guest {1} not found on this node" "$id")"; failed=$((failed + 1)); }
     done
     release_lock
-    log "Done: $(($# - failed))/$# backup(s) succeeded."
+    OP_DONE=$(t "Done: {1}/{2} backup(s) succeeded." "$(($# - failed))" "$#")
+    log "$OP_DONE"
     return "$failed"
 }
 
@@ -554,10 +612,12 @@ dims() {
 
 # Dialogs are sized to their contents instead of filling the screen
 text_lines() { # text -> TL, the number of lines it takes at width W
-    local text=${1//\\n/$'\n'} line
+    local text=${1//\\n/$'\n'} line wide LC_COLLATE=C
     TL=0
     while IFS= read -r line; do
-        TL=$((TL + 1 + ${#line} / (W - 4)))
+        # characters beyond U+2E7F (Chinese, full-width forms) take two columns
+        wide=${line//[$'\u0001'-$'\u2e7f']/}
+        TL=$((TL + 1 + (${#line} + ${#wide}) / (W - 4)))
     done <<<"$text"
 }
 box_dims() { # text, extra lines (input field)
@@ -574,11 +634,11 @@ list_dims() { # text, number of entries
     H=$((LH + TL + 7))
 }
 
-msg() { box_dims "$1"; whiptail --title "$TITLE" --msgbox "$1" "$H" "$W"; }
-confirm() { box_dims "$1"; whiptail --title "$TITLE" --yesno "$1" "$H" "$W"; }
-confirm_no() { box_dims "$1"; whiptail --title "$TITLE" --defaultno --yesno "$1" "$H" "$W"; }
-input() { box_dims "$1" 2; whiptail --title "$TITLE" --inputbox "$1" "$H" "$W" "${2:-}" 3>&1 1>&2 2>&3; }
-password() { box_dims "$1" 2; whiptail --title "$TITLE" --passwordbox "$1" "$H" "$W" 3>&1 1>&2 2>&3; }
+msg() { box_dims "$1"; whiptail --title "$TITLE" "${BTN_OK[@]}" --msgbox "$1" "$H" "$W"; }
+confirm() { box_dims "$1"; whiptail --title "$TITLE" "${BTN_YN[@]}" --yesno "$1" "$H" "$W"; }
+confirm_no() { box_dims "$1"; whiptail --title "$TITLE" "${BTN_YN[@]}" --defaultno --yesno "$1" "$H" "$W"; }
+input() { box_dims "$1" 2; whiptail --title "$TITLE" "${BTN_OK[@]}" "${BTN_CANCEL[@]}" --inputbox "$1" "$H" "$W" "${2:-}" 3>&1 1>&2 2>&3; }
+password() { box_dims "$1" 2; whiptail --title "$TITLE" "${BTN_OK[@]}" "${BTN_CANCEL[@]}" --passwordbox "$1" "$H" "$W" 3>&1 1>&2 2>&3; }
 # A text that fits is closed with Enter; a scrolling one keeps the keyboard
 # focus on the text, hence the reminder in its title.
 textbox() { # title, file
@@ -588,23 +648,24 @@ textbox() { # title, file
         H=$(($(wc -l <"$2") + 6))
     else
         opts=(--scrolltext)
-        title+=" (Tab, then Enter, to close)"
+        title+=" $(t "(Tab, then Enter, to close)")"
     fi
-    whiptail --title "$title" "${opts[@]}" --textbox "$2" "$H" "$W"
+    whiptail --title "$title" "${BTN_OK[@]}" "${opts[@]}" --textbox "$2" "$H" "$W"
 }
 # The second button reads "Cancel" unless CANCEL is set (Quit, Back)
 menu() { # text, then tag/label pairs
     local text=$1
     shift
     list_dims "$text" $(($# / 2))
-    whiptail --title "$TITLE" --cancel-button "${CANCEL:-Cancel}" \
+    # i18n: "Back" "Quit"
+    whiptail --title "$TITLE" "${BTN_OK[@]}" --cancel-button "$(t "${CANCEL:-Cancel}")" \
         --menu "$text" "$H" "$W" "$LH" "$@" 3>&1 1>&2 2>&3
 }
 checklist() { # text, then tag/label/state triplets
     local text=$1
     shift
     list_dims "$text" $(($# / 3))
-    whiptail --title "$TITLE" --separate-output --checklist "$text" "$H" "$W" "$LH" "$@" 3>&1 1>&2 2>&3
+    whiptail --title "$TITLE" "${BTN_OK[@]}" "${BTN_CANCEL[@]}" --separate-output --checklist "$text" "$H" "$W" "$LH" "$@" 3>&1 1>&2 2>&3
 }
 
 # Runs an operation behind a gauge, then displays what it reported. The
@@ -616,6 +677,7 @@ ui_run() { # heading, command…
     dims
     G_HEAD=$heading
     G_STEP=""
+    OP_DONE=""
     # the gauge keeps the height of its first text: four lines
     exec 8> >(exec whiptail --title "$TITLE" --gauge "$heading"$'\n \n \n ' 11 "$W" 0)
     GAUGE_PID=$!
@@ -632,15 +694,18 @@ ui_run() { # heading, command…
     # the summary: the outcome first, then what was done and what failed,
     # without the steps (lines ending in '…') nor rclone's retries
     {
-        grep '^Done:' "$out" | tail -n 1
+        echo "$OP_DONE"
         echo
-        grep -vE '^Done:|…$|^=== |^rclone: Attempt |^$' "$out" | awk '!seen[$0]++'
-        printf '\nDuration: %s. The details are recorded in the log.\n' "$(human_duration $((SECONDS - start)))"
-    } | sed '1{/^$/d}' | cat -s | fold -s -w $((W - 6)) >"$out.txt"
-    if (($(wc -l <"$out.txt") + 6 <= H)); then
-        whiptail --title "$TITLE — $heading" --msgbox "$(<"$out.txt")" $(($(wc -l <"$out.txt") + 6)) "$W"
+        grep -vxF -- "$OP_DONE" "$out" | grep -vE '…$|^=== |^rclone: Attempt |^$' | awk '!seen[$0]++'
+        echo
+        t "Duration: {1}. The details are recorded in the log." "$(human_duration $((SECONDS - start)))"
+    } | sed '1{/^$/d}' | cat -s >"$out.txt"
+    text_lines "$(<"$out.txt")"
+    if ((TL + 6 <= H)); then
+        whiptail --title "$TITLE — $heading" "${BTN_OK[@]}" --msgbox "$(<"$out.txt")" $((TL + 6)) "$W"
     else
-        textbox "$TITLE — $heading" "$out.txt"
+        fold -s -w $((W - 6)) "$out.txt" >"$out"
+        textbox "$TITLE — $heading" "$out"
     fi
     rm -f "$out" "$out.txt"
     return "$rc"
@@ -657,7 +722,7 @@ ui_abort() {
     # is addressed directly
     stty sane </dev/tty 2>/dev/null
     clear >/dev/tty
-    echo "Interrupted." >/dev/tty
+    t "Interrupted." >/dev/tty
 }
 
 # Notice displayed while a dialog is being prepared. With its own terminal
@@ -676,7 +741,7 @@ screen() { # heading
 
 need_ready() {
     is_ready && return 0
-    msg "A destination and the encryption must be configured before this function can be used.\n\nPlease complete the 'Configuration' menu first."
+    msg "$(t "A destination and the encryption must be configured before this function can be used.\n\nPlease complete the 'Configuration' menu first.")"
     return 1
 }
 
@@ -690,7 +755,7 @@ pick_dest() {
     case ${#items[@]} in
     0) need_ready; return 1 ;;
     2) id=${items[0]} ;;
-    *) id=$(menu "Select the destination:" "${items[@]}") || return 1 ;;
+    *) id=$(menu "$(t "Select the destination:")" "${items[@]}") || return 1 ;;
     esac
     use_dest "$id"
 }
@@ -706,8 +771,8 @@ pick_dests() {
     0) need_ready; return 1 ;;
     3) DESTS=("${items[0]}") ;;
     *)
-        sel=$(checklist "Select the destinations of the backup (Space to select, Enter to confirm).\n\nThe archive is created once, then uploaded to each of them." "${items[@]}") || return 1
-        [[ -n $sel ]] || { msg "No destination was selected."; return 1; }
+        sel=$(checklist "$(t "Select the destinations of the backup (Space to select, Enter to confirm).\n\nThe archive is created once, then uploaded to each of them.")" "${items[@]}") || return 1
+        [[ -n $sel ]] || { msg "$(t "No destination was selected.")"; return 1; }
         mapfile -t DESTS <<<"$sel"
         ;;
     esac
@@ -716,9 +781,9 @@ pick_dests() {
 # Loads the remote listing into the BACKUPS array (one TSV line per entry)
 load_backups() {
     local out
-    busy "Reading the list of backups from $DEST_NAME…"
+    busy "$(t "Reading the list of backups from {1}…" "$DEST_NAME")"
     if ! out=$(remote_list); then
-        msg "The list of backups could not be read from $DEST_NAME.\n\nPlease verify the connection (Configuration > Test the connections)."
+        msg "$(t "The list of backups could not be read from {1}.\n\nPlease verify the connection (Configuration > Test the connections)." "$DEST_NAME")"
         return 1
     fi
     BACKUPS=()
@@ -738,18 +803,18 @@ ui_backup() {
     while IFS=$'\t' read -r id type name status; do
         [[ -n $id ]] && items+=("$id" "$(printf '%-4s %-22.22s %s' "$type" "$name" "$status")" OFF)
     done < <(guest_list)
-    ((${#items[@]})) || { msg "No virtual machine or container was found on this node."; return; }
+    ((${#items[@]})) || { msg "$(t "No virtual machine or container was found on this node.")"; return; }
     free=$(df -h --output=avail "$STAGING_DIR" 2>/dev/null | tail -n1 | tr -d ' ')
-    sel=$(checklist "Select the guests to back up (Space to select, Enter to confirm).\n\nStaging folder: $STAGING_DIR (${free:-?} free)\nMode: $VZDUMP_MODE — compression: $COMPRESS — default retention: $KEEP_DEFAULT" "${items[@]}") || return
+    sel=$(checklist "$(t "Select the guests to back up (Space to select, Enter to confirm).\n\nStaging folder: {1} ({2} free)\nMode: {3} — compression: {4} — default retention: {5}" "$STAGING_DIR" "${free:-?}" "$VZDUMP_MODE" "$COMPRESS" "$KEEP_DEFAULT")" "${items[@]}") || return
     [[ -n $sel ]] || return
     # shellcheck disable=SC2086
-    ui_run "Backup" backup_guests $sel
+    ui_run "$(t "Backup")" backup_guests $sel
 }
 
 ui_list() {
     need_ready || return
     load_backups || return
-    ((${#BACKUPS[@]})) || { msg "No backup was found on $DEST_NAME."; return; }
+    ((${#BACKUPS[@]})) || { msg "$(t "No backup was found on {1}." "$DEST_NAME")"; return; }
     local tmp line total=0 size
     tmp=$(mktemp)
     {
@@ -761,40 +826,41 @@ ui_list() {
             total=$((total + size))
         done
         echo
-        echo "${#BACKUPS[@]} backup(s), $(human_size "$total") in total (size before encryption)"
+        echo "$(t "{1} backup(s), {2} in total (size before encryption)" "${#BACKUPS[@]}" "$(human_size "$total")")"
     } >"$tmp"
-    textbox "$TITLE — backups on $DEST_NAME" "$tmp"
+    textbox "$(t "{1} — backups on {2}" "$TITLE" "$DEST_NAME")" "$tmp"
     rm -f "$tmp"
 }
 
 ui_delete() {
     need_ready || return
     load_backups || return
-    ((${#BACKUPS[@]})) || { msg "No backup was found on $DEST_NAME."; return; }
+    ((${#BACKUPS[@]})) || { msg "$(t "No backup was found on {1}." "$DEST_NAME")"; return; }
     local items=() i sel n=0
     for i in "${!BACKUPS[@]}"; do
         items+=("$i" "$(backup_label "${BACKUPS[$i]}")" OFF)
     done
-    sel=$(checklist "Select the backups to delete from $DEST_NAME (Space to select, Enter to confirm)." "${items[@]}") || return
+    sel=$(checklist "$(t "Select the backups to delete from {1} (Space to select, Enter to confirm)." "$DEST_NAME")" "${items[@]}") || return
     [[ -n $sel ]] || return
     n=$(wc -l <<<"$sel")
-    confirm_no "Delete $n backup(s) from $DEST_NAME?\n\nDeleted files remain in the recycle bin of the account, still encrypted, until it is emptied." || return
+    confirm_no "$(t "Delete {1} backup(s) from {2}?\n\nDeleted files remain in the recycle bin of the account, still encrypted, until it is emptied." "$n" "$DEST_NAME")" || return
     # shellcheck disable=SC2086
-    ui_run "Deletion on $DEST_NAME" op_delete $sel
+    ui_run "$(t "Deletion on {1}" "$DEST_NAME")" op_delete $sel
 }
 
 op_delete() { # indexes in BACKUPS
     local i n=0
     acquire_lock || return 1
     for i; do
-        log "Deleting $(cut -f6 <<<"${BACKUPS[$i]}")"
-        delete_backup "$(cut -f6 <<<"${BACKUPS[$i]}")" || log "ERROR: deletion failed"
+        log "$(t "Deleting {1}" "$(cut -f6 <<<"${BACKUPS[$i]}")")"
+        delete_backup "$(cut -f6 <<<"${BACKUPS[$i]}")" || log "ERROR: $(t "deletion failed")"
         n=$((n + 1))
         gauge $((n * 100 / $#)) ""
     done
     rclone rmdirs "$CRYPT_REMOTE:" --leave-root 2>>"$LOG_FILE"
     release_lock
-    log "Done: $# backup(s) processed."
+    OP_DONE=$(t "Done: {1} backup(s) processed." "$#")
+    log "$OP_DONE"
 }
 
 valid_count() { [[ $1 =~ ^[0-9]+$ ]]; }
@@ -802,34 +868,34 @@ valid_count() { [[ $1 =~ ^[0-9]+$ ]]; }
 ui_retention() {
     local choice v id items type name status
     while :; do
-        choice=$(CANCEL=Back menu "Number of versions retained for each guest.\nA value of 0 retains every version (no pruning)." \
-            D "Default value: $KEEP_DEFAULT" \
-            G "Value per guest (${#KEEP_BY_ID[@]} defined)") || return
+        choice=$(CANCEL=Back menu "$(t "Number of versions retained for each guest.\nA value of 0 retains every version (no pruning).")" \
+            D "$(t "Default value: {1}" "$KEEP_DEFAULT")" \
+            G "$(t "Value per guest ({1} defined)" "${#KEEP_BY_ID[@]}")") || return
         case $choice in
         D)
-            v=$(input "Number of versions retained by default (0 = retain every version):" "$KEEP_DEFAULT") || continue
-            valid_count "$v" || { msg "The value entered is not valid."; continue; }
+            v=$(input "$(t "Number of versions retained by default (0 = retain every version):")" "$KEEP_DEFAULT") || continue
+            valid_count "$v" || { msg "$(t "The value entered is not valid.")"; continue; }
             KEEP_DEFAULT=$v
             save_config
             ;;
         G)
             items=()
             while IFS=$'\t' read -r id type name status; do
-                [[ -n $id ]] && items+=("$id" "$(printf '%-22.22s retains: %s' "$name" "${KEEP_BY_ID[$id]:-default ($KEEP_DEFAULT)}")")
+                [[ -n $id ]] && items+=("$id" "$(printf '%-22.22s %s' "$name" "$(t "retains: {1}" "${KEEP_BY_ID[$id]:-$(t "default ({1})" "$KEEP_DEFAULT")}")")")
             done < <(guest_list)
             # guests gone from the node that still have a setting
             for id in "${!KEEP_BY_ID[@]}"; do
-                [[ " ${items[*]} " == *" $id "* ]] || items+=("$id" "(not on this node) retains: ${KEEP_BY_ID[$id]}")
+                [[ " ${items[*]} " == *" $id "* ]] || items+=("$id" "$(t "(not on this node) retains: {1}" "${KEEP_BY_ID[$id]}")")
             done
-            ((${#items[@]})) || { msg "No guest was found."; continue; }
-            id=$(menu "Select the guest:" "${items[@]}") || continue
-            v=$(input "Number of versions retained for guest $id\n(empty = default value, 0 = retain every version):" "${KEEP_BY_ID[$id]:-}") || continue
+            ((${#items[@]})) || { msg "$(t "No guest was found.")"; continue; }
+            id=$(menu "$(t "Select the guest:")" "${items[@]}") || continue
+            v=$(input "$(t "Number of versions retained for guest {1}\n(empty = default value, 0 = retain every version):" "$id")" "${KEEP_BY_ID[$id]:-}") || continue
             if [[ -z $v ]]; then
                 unset "KEEP_BY_ID[$id]"
             elif valid_count "$v"; then
                 KEEP_BY_ID[$id]=$v
             else
-                msg "The value entered is not valid."
+                msg "$(t "The value entered is not valid.")"
                 continue
             fi
             save_config
@@ -840,8 +906,8 @@ ui_retention() {
 
 ui_prune() {
     need_ready || return
-    confirm_no "Apply the retention policy now?\n\nFor each guest, the backups in excess of the configured number of versions will be deleted from $DEST_NAME, oldest first." || return
-    ui_run "Retention on $DEST_NAME" op_locked prune_remote
+    confirm_no "$(t "Apply the retention policy now?\n\nFor each guest, the backups in excess of the configured number of versions will be deleted from {1}, oldest first." "$DEST_NAME")" || return
+    ui_run "$(t "Retention on {1}" "$DEST_NAME")" op_locked prune_remote
 }
 
 # Runs a command while holding the lock
@@ -857,13 +923,13 @@ op_locked() { # command…
 ui_about() {
     need_ready || return
     local out
-    busy "Querying $DEST_NAME…"
+    busy "$(t "Querying {1}…" "$DEST_NAME")"
     if out=$(rclone about "$BASE_REMOTE:" 2>/dev/null); then
-        msg "Storage of the $DEST_NAME account:\n\n$out"
+        msg "$(t "Storage of the {1} account:\n\n{2}" "$DEST_NAME" "$out")"
     else
         # no quota information (S3, some SFTP servers): size of the backups
         out=$(rclone size "$CRYPT_REMOTE:" 2>&1)
-        msg "Space used by the backups on $DEST_NAME:\n\n$out"
+        msg "$(t "Space used by the backups on {1}:\n\n{2}" "$DEST_NAME" "$out")"
     fi
 }
 
@@ -871,12 +937,12 @@ ui_manage() {
     local choice
     pick_dest || return
     while :; do
-        choice=$(CANCEL=Back menu "Management of the backups stored on $DEST_NAME" \
-            L "List the backups" \
-            D "Delete backups" \
-            V "Retention policy" \
-            P "Apply the retention policy now" \
-            S "Storage used on $DEST_NAME") || return
+        choice=$(CANCEL=Back menu "$(t "Management of the backups stored on {1}" "$DEST_NAME")" \
+            L "$(t "List the backups")" \
+            D "$(t "Delete backups")" \
+            V "$(t "Retention policy")" \
+            P "$(t "Apply the retention policy now")" \
+            S "$(t "Storage used on {1}" "$DEST_NAME")") || return
         case $choice in
         L) ui_list ;;
         D) ui_delete ;;
@@ -898,47 +964,47 @@ pick_storage() { # guest type -> storage name
     local content=images items=() name stype status avail
     [[ $1 == lxc ]] && content=rootdir
     while read -r name stype status _ _ avail _; do
-        [[ $status == active ]] && items+=("$name" "$(printf '%-8s %s free' "$stype" "$(human_size $((avail * 1024)))")")
+        [[ $status == active ]] && items+=("$name" "$(printf '%-8s %s' "$stype" "$(t "{1} free" "$(human_size $((avail * 1024)))")")")
     done < <(pvesm status --content "$content" 2>/dev/null | tail -n +2)
-    ((${#items[@]})) || { msg "No active storage accepts this type of disk."; return 1; }
-    menu "Select the target storage for the disks:" "${items[@]}"
+    ((${#items[@]})) || { msg "$(t "No active storage accepts this type of disk.")"; return 1; }
+    menu "$(t "Select the target storage for the disks:")" "${items[@]}"
 }
 
 ui_restore() {
     pick_dest || return
     load_backups || return
-    ((${#BACKUPS[@]})) || { msg "No backup was found on $DEST_NAME."; return; }
+    ((${#BACKUPS[@]})) || { msg "$(t "No backup was found on {1}." "$DEST_NAME")"; return; }
     local items=() i sel id ts type name size path action target storage
     local force=() unique=() free
     for i in "${!BACKUPS[@]}"; do
         items+=("$i" "$(backup_label "${BACKUPS[$i]}")")
     done
-    sel=$(menu "Select the backup to restore:" "${items[@]}") || return
+    sel=$(menu "$(t "Select the backup to restore:")" "${items[@]}") || return
     IFS=$'\t' read -r id ts type name size path <<<"${BACKUPS[$sel]}"
 
-    action=$(menu "Backup: $type $id ($name) from $(human_ts "$ts"), $(human_size "$size")" \
-        O "Restore under the original ID ($id)" \
-        N "Restore under a new ID (as a copy)" \
-        D "Download the decrypted archive without restoring it") || return
+    action=$(menu "$(t "Backup: {1} {2} ({3}) from {4}, {5}" "$type" "$id" "$name" "$(human_ts "$ts")" "$(human_size "$size")")" \
+        O "$(t "Restore under the original ID ({1})" "$id")" \
+        N "$(t "Restore under a new ID (as a copy)")" \
+        D "$(t "Download the decrypted archive without restoring it")") || return
 
     case $action in
     O)
         target=$id
         if guest_exists "$target"; then
-            confirm_no "Warning: guest $target already exists.\n\nThe restore will overwrite its configuration and its disks. The guest must be stopped beforehand.\n\nDo you wish to continue?" || return
+            confirm_no "$(t "Warning: guest {1} already exists.\n\nThe restore will overwrite its configuration and its disks. The guest must be stopped beforehand.\n\nDo you wish to continue?" "$target")" || return
             force=(--force 1)
         fi
         ;;
     N)
-        target=$(input "New ID:" "$(pvesh get /cluster/nextid 2>/dev/null)") || return
-        [[ $target =~ ^[0-9]+$ ]] || { msg "The ID entered is not valid."; return; }
-        guest_exists "$target" && { msg "ID $target is already in use."; return; }
-        confirm "Generate new MAC addresses?\n\nThis is recommended when the original guest remains in service." && unique=(--unique 1)
+        target=$(input "$(t "New ID:")" "$(pvesh get /cluster/nextid 2>/dev/null)") || return
+        [[ $target =~ ^[0-9]+$ ]] || { msg "$(t "The ID entered is not valid.")"; return; }
+        guest_exists "$target" && { msg "$(t "ID {1} is already in use." "$target")"; return; }
+        confirm "$(t "Generate new MAC addresses?\n\nThis is recommended when the original guest remains in service.")" && unique=(--unique 1)
         ;;
     D)
-        target=$(input "Destination folder:" "$STAGING_DIR") || return
-        [[ -d $target && -w $target ]] || { msg "The folder does not exist or is not writable."; return; }
-        ui_run "Download from $DEST_NAME" op_locked op_download "$path" "$target"
+        target=$(input "$(t "Destination folder:")" "$STAGING_DIR") || return
+        [[ -d $target && -w $target ]] || { msg "$(t "The folder does not exist or is not writable.")"; return; }
+        ui_run "$(t "Download from {1}" "$DEST_NAME")" op_locked op_download "$path" "$target"
         return
         ;;
     esac
@@ -946,19 +1012,19 @@ ui_restore() {
     storage=$(pick_storage "$type") || return
     free=$(df --output=avail -B1 "$STAGING_DIR" 2>/dev/null | tail -n1 | tr -d ' ')
     if [[ -n $free ]] && ((free < size)); then
-        msg "There is not enough space in $STAGING_DIR to download the archive ($(human_size "$size") required, $(human_size "$free") available).\n\nPlease select another staging folder in the Configuration menu."
+        msg "$(t "There is not enough space in {1} to download the archive ({2} required, {3} available).\n\nPlease select another staging folder in the Configuration menu." "$STAGING_DIR" "$(human_size "$size")" "$(human_size "$free")")"
         return
     fi
 
-    ui_run "Restore of $type $target" op_locked op_restore "$path" "$type" "$target" "$storage" "${force[@]}" "${unique[@]}"
+    ui_run "$(t "Restore of {1} {2}" "$type" "$target")" op_locked op_restore "$path" "$type" "$target" "$storage" "${force[@]}" "${unique[@]}"
 }
 
 op_download() { # archive path on the remote, local folder
-    log "Downloading $1 to $2"
+    log "$(t "Downloading {1} to {2}" "$1" "$2")"
     if rclone_copy "$CRYPT_REMOTE:$1" "$2"; then
-        log "Archive available: $2/$(basename "$1")"
+        log "$(t "Archive available: {1}/{2}" "$2" "$(basename "$1")")"
     else
-        log "ERROR: download from $DEST_NAME failed."
+        log "ERROR: $(t "download from {1} failed." "$DEST_NAME")"
         return 1
     fi
 }
@@ -968,11 +1034,11 @@ op_restore() { # archive path on the remote, type, target ID, storage, options�
     shift 4
     tmp=$(mktemp -d "$STAGING_DIR/proxdump.XXXXXX") || return 1
     CLEANUP_DIRS+=("$tmp")
-    log "=== Restoring $path to $type $target (storage $storage) ==="
-    log "Downloading the archive from $DEST_NAME…"
+    log "=== $(t "Restoring {1} to {2} {3} (storage {4})" "$path" "$type" "$target" "$storage") ==="
+    log "$(t "Downloading the archive from {1}…" "$DEST_NAME")"
     if rclone_copy "$CRYPT_REMOTE:$path" "$tmp"; then
         file="$tmp/$(basename "$path")"
-        log "Restoring the archive to storage $storage…"
+        log "$(t "Restoring the archive to storage {1}…" "$storage")"
         if [[ $type == qemu ]]; then
             run_logged "" qmrestore "$file" "$target" --storage "$storage" "$@"
         else
@@ -980,12 +1046,12 @@ op_restore() { # archive path on the remote, type, target ID, storage, options�
         fi
         rc=$?
         if ((rc == 0)); then
-            log "Restore complete: $type $target."
+            log "$(t "Restore complete: {1} {2}." "$type" "$target")"
         else
-            log "ERROR: restore failed (exit code $rc)."
+            log "ERROR: $(t "restore failed (exit code {1})." "$rc")"
         fi
     else
-        log "ERROR: download from $DEST_NAME failed."
+        log "ERROR: $(t "download from {1} failed." "$DEST_NAME")"
         rc=1
     fi
     rm -rf -- "$tmp"
@@ -1021,7 +1087,7 @@ read_token() {
         [[ -z $line ]] && break
         buf+=$line
         token_ok "$(clean_token "$buf")" && break
-        prompt="  (continue pasting, or press Enter to finish) > "
+        prompt="  $(t "(continue pasting, or press Enter to finish)") > "
     done
     # leftovers of the paste, if any ('<---End paste'…)
     while read -r -s -t 0.3 line; do :; done
@@ -1044,7 +1110,7 @@ pick_drive() { # rclone's JSON answer
         i=${real[0]}
     else
         ((${#real[@]} > 2)) && items=("${real[@]}")
-        i=$(menu "Select the drive to use:" "${items[@]}") || return 1
+        i=$(menu "$(t "Select the drive to use:")" "${items[@]}") || return 1
     fi
     jq -r ".Option.Examples[$i].Value" <<<"$out"
 }
@@ -1053,8 +1119,8 @@ pick_drive() { # rclone's JSON answer
 # Explains how to create one and reads its two values, which stay on screen
 # next to the instructions (into GD_CLIENT_ID and GD_CLIENT_SECRET).
 gdrive_client() {
-    screen "Google Drive: OAuth client"
-    cat <<EOF
+    screen "$(t "Google Drive: OAuth client")"
+    t "$(cat <<'EOT'
 Google Drive is accessed through an "OAuth client" that you create, free of
 charge, in the Google Cloud console. This is done once, in a web browser on
 any computer; the two values it produces are then entered below.
@@ -1078,15 +1144,17 @@ any computer; the two values it produces are then entered below.
 7. "Clients" > "Create client": application type "Desktop app", then
    "Create". Google displays the client ID and the client secret.
 
+The names between quotation marks are those of the console in English.
 Press Enter on an empty line to cancel.
-
-EOF
+EOT
+    )"
+    echo
     while :; do
         read -e -r -p "Client ID > " GD_CLIENT_ID || return 1
         GD_CLIENT_ID=$(tr -d '[:space:]' <<<"$GD_CLIENT_ID")
         [[ -n $GD_CLIENT_ID ]] || return 1
         [[ $GD_CLIENT_ID == *.apps.googleusercontent.com ]] && break
-        echo "A client ID ends with '.apps.googleusercontent.com'. Please enter it again."
+        t "A client ID ends with '.apps.googleusercontent.com'. Please enter it again."
     done
     read -e -r -p "Client secret > " GD_CLIENT_SECRET || return 1
     GD_CLIENT_SECRET=$(tr -d '[:space:]' <<<"$GD_CLIENT_SECRET")
@@ -1109,7 +1177,7 @@ trim() { sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<<"$1"; }
 # S3-compatible storage: provider, endpoint, access key and bucket
 s3_setup() {
     local provider hint="" endpoint="" region="" key secret bucket conf
-    provider=$(menu "Select the provider of the S3-compatible storage:" \
+    provider=$(menu "$(t "Select the provider of the S3-compatible storage:")" \
         B2 "Backblaze B2" \
         Cloudflare "Cloudflare R2" \
         Wasabi "Wasabi" \
@@ -1117,42 +1185,42 @@ s3_setup() {
         Hetzner "Hetzner Object Storage" \
         OVHcloud "OVHcloud Object Storage" \
         Scaleway "Scaleway Object Storage" \
-        Minio "MinIO (self-hosted)" \
-        Other "Another S3-compatible service") || return 1
+        Minio "$(t "MinIO (self-hosted)")" \
+        Other "$(t "Another S3-compatible service")") || return 1
     case $provider in
-    B2) hint="shown on the bucket in the Backblaze console, for instance s3.us-west-004.backblazeb2.com" ;;
-    Cloudflare) hint="<account ID>.r2.cloudflarestorage.com, shown on the R2 overview page" ;;
-    Wasabi) hint="for instance s3.eu-central-1.wasabisys.com" ;;
-    Hetzner) hint="for instance fsn1.your-objectstorage.com" ;;
-    OVHcloud) hint="for instance s3.gra.io.cloud.ovh.net" ;;
-    Scaleway) hint="for instance s3.fr-par.scw.cloud" ;;
-    Minio | Other) hint="host name or URL, for instance https://storage.example.org:9000" ;;
+    B2) hint=$(t "shown on the bucket in the Backblaze console, for instance s3.us-west-004.backblazeb2.com") ;;
+    Cloudflare) hint=$(t "<account ID>.r2.cloudflarestorage.com, shown on the R2 overview page") ;;
+    Wasabi) hint=$(t "for instance {1}" "s3.eu-central-1.wasabisys.com") ;;
+    Hetzner) hint=$(t "for instance {1}" "fsn1.your-objectstorage.com") ;;
+    OVHcloud) hint=$(t "for instance {1}" "s3.gra.io.cloud.ovh.net") ;;
+    Scaleway) hint=$(t "for instance {1}" "s3.fr-par.scw.cloud") ;;
+    Minio | Other) hint=$(t "host name or URL, for instance https://storage.example.org:9000") ;;
     esac
     if [[ $provider == AWS ]]; then
-        region=$(input "Region of the bucket (for instance us-east-1):") || return 1
+        region=$(input "$(t "Region of the bucket (for instance us-east-1):")") || return 1
         region=$(trim "$region")
-        [[ -n $region ]] || { msg "The region is required for Amazon S3."; return 1; }
+        [[ -n $region ]] || { msg "$(t "The region is required for Amazon S3.")"; return 1; }
     else
-        endpoint=$(input "Endpoint of the service ($hint):") || return 1
+        endpoint=$(input "$(t "Endpoint of the service ({1}):" "$hint")") || return 1
         endpoint=$(trim "$endpoint")
-        [[ -n $endpoint ]] || { msg "The endpoint may not be empty."; return 1; }
+        [[ -n $endpoint ]] || { msg "$(t "The endpoint may not be empty.")"; return 1; }
         case $provider in
         Cloudflare) region=auto ;;
         B2) ;;
         *)
-            region=$(input "Region, if the provider requires one (otherwise leave empty):") || return 1
+            region=$(input "$(t "Region, if the provider requires one (otherwise leave empty):")") || return 1
             region=$(trim "$region")
             ;;
         esac
     fi
-    key=$(input "Access key ID (for Backblaze: keyID of an application key):") || return 1
+    key=$(input "$(t "Access key ID (for Backblaze: keyID of an application key):")") || return 1
     key=$(trim "$key")
-    secret=$(password "Secret access key (for Backblaze: applicationKey):") || return 1
+    secret=$(password "$(t "Secret access key (for Backblaze: applicationKey):")") || return 1
     secret=$(trim "$secret")
-    [[ -n $key && -n $secret ]] || { msg "The access key and its secret are both required."; return 1; }
-    bucket=$(input "Name of the bucket that will hold the backups.\n\nThe bucket must already exist; this tool does not create it." "${DEST_ROOT[s3]:-}") || return 1
+    [[ -n $key && -n $secret ]] || { msg "$(t "The access key and its secret are both required.")"; return 1; }
+    bucket=$(input "$(t "Name of the bucket that will hold the backups.\n\nThe bucket must already exist; this tool does not create it.")" "${DEST_ROOT[s3]:-}") || return 1
     bucket=$(trim "$bucket")
-    [[ -n $bucket && $bucket != */* ]] || { msg "The bucket name is not valid."; return 1; }
+    [[ -n $bucket && $bucket != */* ]] || { msg "$(t "The bucket name is not valid.")"; return 1; }
 
     [[ $provider == B2 ]] && provider=Other
     conf="provider = $provider"$'\n'"access_key_id = $key"$'\n'"secret_access_key = $secret"
@@ -1169,53 +1237,54 @@ s3_setup() {
 # SFTP server: host, account, key or password, host key, folder
 sftp_setup() {
     local host port user auth conf key="$CONF_DIR/sftp_key" known="$CONF_DIR/sftp_known_hosts" scan folder pass
-    host=$(input "Host name or IP address of the SFTP server:") || return 1
+    host=$(input "$(t "Host name or IP address of the SFTP server:")") || return 1
     host=$(trim "$host")
-    [[ -n $host && $host != *[[:space:]/]* ]] || { msg "The host name is not valid."; return 1; }
-    port=$(input "SSH port of the server:" "22") || return 1
-    [[ $port =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || { msg "The port is not valid."; return 1; }
-    user=$(input "User name on the server:") || return 1
+    [[ -n $host && $host != *[[:space:]/]* ]] || { msg "$(t "The host name is not valid.")"; return 1; }
+    port=$(input "$(t "SSH port of the server:")" "22") || return 1
+    [[ $port =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || { msg "$(t "The port is not valid.")"; return 1; }
+    user=$(input "$(t "User name on the server:")") || return 1
     user=$(trim "$user")
-    [[ -n $user ]] || { msg "The user name may not be empty."; return 1; }
+    [[ -n $user ]] || { msg "$(t "The user name may not be empty.")"; return 1; }
 
     # the identity of the server is recorded now and checked at every connection
-    busy "Contacting $host…"
+    busy "$(t "Contacting {1}…" "$host")"
     scan=$(ssh-keyscan -T 10 -p "$port" "$host" 2>/dev/null)
-    [[ -n $scan ]] || { msg "No SSH server answered at $host, port $port."; return 1; }
-    confirm "The server presents the following host keys:\n\n$(ssh-keygen -lf - <<<"$scan" | awk '{print "  " $NF " " $2}')\n\nThey will be recorded, and the connection refused if they ever change. Compare them with those of the server if you have them.\n\nDo you wish to continue?" || return 1
+    [[ -n $scan ]] || { msg "$(t "No SSH server answered at {1}, port {2}." "$host" "$port")"; return 1; }
+    confirm "$(t "The server presents the following host keys:\n\n{1}\n\nThey will be recorded, and the connection refused if they ever change. Compare them with those of the server if you have them.\n\nDo you wish to continue?" "$(ssh-keygen -lf - <<<"$scan" | awk '{print "  " $NF " " $2}')")" || return 1
 
-    auth=$(menu "Select how this server signs in to $host:" \
-        K "SSH key dedicated to this tool (recommended)" \
-        P "Password") || return 1
+    auth=$(menu "$(t "Select how this server signs in to {1}:" "$host")" \
+        K "$(t "SSH key dedicated to this tool (recommended)")" \
+        P "$(t "Password")") || return 1
     conf="host = $host"$'\n'"port = $port"$'\n'"user = $user"
     install -d -m 700 "$CONF_DIR"
     case $auth in
     K)
         if [[ ! -f $key ]]; then
             ssh-keygen -q -t ed25519 -N "" -C "proxdump@$(hostname -s)" -f "$key" ||
-                { msg "The SSH key could not be generated."; return 1; }
+                { msg "$(t "The SSH key could not be generated.")"; return 1; }
         fi
         chmod 600 "$key"
-        screen "SFTP server: SSH key"
-        cat <<EOF
+        screen "$(t "SFTP server: SSH key")"
+        t "$(cat <<'EOT'
 The following public key identifies this server. Add it, on a single line,
-to the file ~/.ssh/authorized_keys of the account '$user' on $host (or
+to the file ~/.ssh/authorized_keys of the account '{1}' on {2} (or
 through the control panel of the hosting provider):
 
-$(cat "$key.pub")
-
-EOF
-        read -rp "Press Enter once the key has been added. " _
+{3}
+EOT
+        )" "$user" "$host" "$(cat "$key.pub")"
+        echo
+        read -rp "$(t "Press Enter once the key has been added.") " _
         conf+=$'\n'"key_file = $key"
         ;;
     P)
-        pass=$(password "Password of '$user' on $host:") || return 1
-        [[ -n $pass ]] || { msg "The password may not be empty."; return 1; }
+        pass=$(password "$(t "Password of '{1}' on {2}:" "$user" "$host")") || return 1
+        [[ -n $pass ]] || { msg "$(t "The password may not be empty.")"; return 1; }
         pass=$(printf '%s\n' "$pass" | rclone obscure -) || return 1
         conf+=$'\n'"pass = $pass"
         ;;
     esac
-    folder=$(input "Folder of the server that will hold the backups (created if necessary).\n\nA path without a leading '/' is relative to the home folder of '$user'; leave empty to use the home folder itself." "${DEST_ROOT[sftp]-backups}") || return 1
+    folder=$(input "$(t "Folder of the server that will hold the backups (created if necessary).\n\nA path without a leading '/' is relative to the home folder of '{1}'; leave empty to use the home folder itself." "$user")" "${DEST_ROOT[sftp]-backups}") || return 1
     folder=$(trim "$folder")
     [[ $folder != / ]] && folder=${folder%/}
 
@@ -1249,7 +1318,7 @@ remote_wizard() {
     while :; do
         state=$(jq -r '.State // ""' <<<"$out" 2>/dev/null)
         if [[ -z $out || $(jq -r '.Error // ""' <<<"$out" 2>/dev/null) != "" ]]; then
-            msg "rclone reported an error:\n\n$(jq -r '.Error // ""' <<<"$out" 2>/dev/null)\n$(grep -i 'error' "$err" | tail -n 3)"
+            msg "$(t "rclone reported an error:\n\n{1}\n{2}" "$(jq -r '.Error // ""' <<<"$out" 2>/dev/null)" "$(grep -i 'error' "$err" | tail -n 3)")"
             [[ -z $state ]] && { wizard_abort; return 1; }
         fi
         [[ -z $state ]] && break
@@ -1259,20 +1328,20 @@ remote_wizard() {
         n=$(jq -r '.Option.Examples | length' <<<"$out")
 
         if [[ $qname == config_token ]]; then
-            screen "$DEST_NAME authorization"
-            cat <<EOF
+            screen "$(t "{1} authorization" "$DEST_NAME")"
+            t "$(cat <<'EOT'
 This server has no web browser: access is authorized once, from another
 computer, and the resulting token is pasted here.
 
 1. On a computer equipped with a web browser, install rclone
    (https://rclone.org/downloads/), preferably the version used by this
-   server: $(rclone version 2>/dev/null | head -n1).
+   server: {1}.
 
 2. On that computer, open a terminal and run, exactly as shown:
 
-       $(grep -o 'rclone authorize .*' <<<"$help" | head -n1)
+       {2}
 
-3. The browser opens the ${DEST_VENDORS[$DEST]} sign-in page. Sign in with the account
+3. The browser opens the {3} sign-in page. Sign in with the account
    that will hold the backups, then accept the access requested by rclone.
    The browser confirms with "Success!".
 
@@ -1289,15 +1358,16 @@ computer, and the resulting token is pasted here.
 
 The token grants access to the files of the account: treat it as a password.
 Press Enter on an empty line to cancel.
-
-EOF
+EOT
+            )" "$(rclone version 2>/dev/null | head -n1)" "$(grep -o 'rclone authorize .*' <<<"$help" | head -n1)" "${DEST_VENDORS[$DEST]}"
+            echo
             while :; do
                 token=$(read_token)
                 [[ -n $token ]] || { wizard_abort; return 1; }
                 token_ok "$token" && break
                 echo
-                echo "The token is incomplete or invalid (${#token} characters received): it must begin"
-                echo "with '{' and end with '}'. Please paste it again in full, or press Enter to cancel."
+                t "The token is incomplete or invalid ({1} characters received): it must begin with '{' and end with '}'. Please paste it again in full, or press Enter to cancel." "${#token}"
+                echo
                 echo
             done
             result=$token
@@ -1305,7 +1375,7 @@ EOF
             result=$(pick_drive "$out") || { wizard_abort; return 1; }
         elif [[ $qname == config_drive_ok ]]; then
             # rclone's final confirmation: the drive found, its type and its URL
-            if confirm "Use the following drive?\n\n$(sed '1d;/./,$!d' <<<"$help")"; then result=true; else result=false; fi
+            if confirm "$(t "Use the following drive?\n\n{1}" "$(sed '1d;/./,$!d' <<<"$help")")"; then result=true; else result=false; fi
         elif [[ $(jq -r '.Option.Type' <<<"$out") == bool ]]; then
             # the default answer is rclone's own
             if [[ $def == true ]]; then
@@ -1335,33 +1405,33 @@ ui_remove_remote() {
     local n note="" where
     load_schedules
     n=${#SCHEDULES[@]}
-    ((n)) && note="\n\n$n schedule(s) are defined: those that use $DEST_NAME will fail until a connection is configured again."
-    confirm_no "Remove the $DEST_NAME connection from this server?\n\nThe credentials stored in $RCLONE_CONFIG will be deleted. The backups on $DEST_NAME and the encryption passphrase are kept.$note\n\nDo you wish to continue?" || return
+    ((n)) && note="\n\n$(t "{1} schedule(s) are defined: those that use {2} will fail until a connection is configured again." "$n" "$DEST_NAME")"
+    confirm_no "$(t "Remove the {1} connection from this server?\n\nThe credentials stored in {2} will be deleted. The backups on {1} and the encryption passphrase are kept.{3}\n\nDo you wish to continue?" "$DEST_NAME" "$RCLONE_CONFIG" "$note")" || return
     rclone config delete "$BASE_REMOTE" 2>>"$LOG_FILE"
     if has_remote "$BASE_REMOTE"; then
-        msg "The $DEST_NAME connection could not be removed. Please consult the log."
+        msg "$(t "The {1} connection could not be removed. Please consult the log." "$DEST_NAME")"
         return
     fi
     keepalive_set "$DEST" off
-    log "$DEST_NAME connection removed from this server." >/dev/null
+    log "$(t "{1} connection removed from this server." "$DEST_NAME")" >/dev/null
     case $DEST in
-    onedrive) where="The authorization granted to rclone remains registered with Microsoft. To withdraw it as well, remove the application from the list of authorized applications:\n\n  Personal account:\n    https://account.microsoft.com/privacy/app-access\n\n  Work or school account:\n    https://myapps.microsoft.com" ;;
-    gdrive) where="The authorization granted to rclone remains registered with Google. To withdraw it as well, remove the application from the list of authorized applications:\n\n  https://myaccount.google.com/connections" ;;
-    dropbox) where="The authorization granted to rclone remains registered with Dropbox. To withdraw it as well, remove the application from the list of connected applications:\n\n  https://www.dropbox.com/account/connected_apps" ;;
-    s3) where="The access key itself remains valid. To withdraw it as well, delete it in the console of the storage provider." ;;
-    sftp) where="The SSH key of this tool ($CONF_DIR/sftp_key) is kept for a later connection. To withdraw its access, remove its line from ~/.ssh/authorized_keys on the server." ;;
+    onedrive) where="$(t "The authorization granted to rclone remains registered with {1}. To withdraw it as well, remove the application from the list of authorized applications:" Microsoft)\n\n  $(t "Personal account:")\n    https://account.microsoft.com/privacy/app-access\n\n  $(t "Work or school account:")\n    https://myapps.microsoft.com" ;;
+    gdrive) where="$(t "The authorization granted to rclone remains registered with {1}. To withdraw it as well, remove the application from the list of authorized applications:" Google)\n\n  https://myaccount.google.com/connections" ;;
+    dropbox) where="$(t "The authorization granted to rclone remains registered with {1}. To withdraw it as well, remove the application from the list of authorized applications:" Dropbox)\n\n  https://www.dropbox.com/account/connected_apps" ;;
+    s3) where=$(t "The access key itself remains valid. To withdraw it as well, delete it in the console of the storage provider.") ;;
+    sftp) where=$(t "The SSH key of this tool ({1}) is kept for a later connection. To withdraw its access, remove its line from ~/.ssh/authorized_keys on the server." "$CONF_DIR/sftp_key") ;;
     esac
-    msg "The $DEST_NAME connection has been removed from this server.\n\n$where"
+    msg "$(t "The {1} connection has been removed from this server.\n\n{2}" "$DEST_NAME" "$where")"
 }
 
 # Daily task that only queries the account, so that a token which is not
 # used by any schedule does not lapse
 ui_keepalive() {
     if keepalive_on "$DEST"; then
-        confirm "The daily token refresh is enabled for $DEST_NAME.\n\nDo you wish to disable it?" || return
+        confirm "$(t "The daily token refresh is enabled for {1}.\n\nDo you wish to disable it?" "$DEST_NAME")" || return
         keepalive_set "$DEST" off
     else
-        confirm "The $DEST_NAME access token lapses when it stays unused for ${DEST_TOKEN_LIFE[$DEST]}; the connection then has to be configured again.\n\nA daily task (at $KEEPALIVE_TIME) can query the account for the sole purpose of keeping the token active. It transfers no data, and its result is recorded in the log.\n\nThis is unnecessary when a schedule already backs up to $DEST_NAME regularly.\n\nDo you wish to enable it?" || return
+        confirm "$(t "The {1} access token lapses when it stays unused for {2}; the connection then has to be configured again.\n\nA daily task (at {3}) can query the account for the sole purpose of keeping the token active. It transfers no data, and its result is recorded in the log.\n\nThis is unnecessary when a schedule already backs up to {1} regularly.\n\nDo you wish to enable it?" "$DEST_NAME" "$(t "${DEST_TOKEN_LIFE[$DEST]}")" "$KEEPALIVE_TIME")" || return
         keepalive_set "$DEST" on
     fi
 }
@@ -1371,14 +1441,14 @@ ui_setup_remote() { # for the current destination
     if has_remote "$BASE_REMOTE"; then
         while :; do
             if [[ -n ${DEST_VENDORS[$DEST]:-} ]]; then
-                items=(R "Replace the connection (sign in again, or use another account)")
+                items=(R "$(t "Replace the connection (sign in again, or use another account)")")
             else
-                items=(R "Replace the connection (enter its settings again)")
+                items=(R "$(t "Replace the connection (enter its settings again)")")
             fi
             [[ -n ${DEST_TOKEN_LIFE[$DEST]:-} ]] &&
-                items+=(K "Daily token refresh: $(keepalive_on "$DEST" && echo enabled || echo disabled)")
-            items+=(D "Remove the connection from this server")
-            choice=$(CANCEL=Back menu "The $DEST_NAME connection is configured.\n\nReplacing or removing it does not affect the backups already uploaded." "${items[@]}") || return
+                items+=(K "$(t "Daily token refresh: {1}" "$(keepalive_on "$DEST" && t "enabled" || t "disabled")")")
+            items+=(D "$(t "Remove the connection from this server")")
+            choice=$(CANCEL=Back menu "$(t "The {1} connection is configured.\n\nReplacing or removing it does not affect the backups already uploaded." "$DEST_NAME")" "${items[@]}") || return
             case $choice in
             K) ui_keepalive ;;
             D) ui_remove_remote; return ;;
@@ -1394,13 +1464,13 @@ ui_setup_remote() { # for the current destination
         [[ -f $RCLONE_CONFIG ]] && cp -p "$RCLONE_CONFIG" "$bak"
         if ! "${DEST}_setup"; then
             rm -f "$bak"
-            msg "The $DEST_NAME connection was not completed. The previous configuration, if any, is unchanged."
+            msg "$(t "The {1} connection was not completed. The previous configuration, if any, is unchanged." "$DEST_NAME")"
             return
         fi
         ensure_crypt
         has_remote "$CRYPT_REMOTE" &&
             rclone config update "$CRYPT_REMOTE" remote="$(dest_base "$DEST")" --no-obscure >/dev/null 2>>"$LOG_FILE"
-        if ! ui_test && ! confirm_no "Do you wish to keep these settings nevertheless?\n\nOtherwise the previous configuration, if any, is restored."; then
+        if ! ui_test && ! confirm_no "$(t "Do you wish to keep these settings nevertheless?\n\nOtherwise the previous configuration, if any, is restored.")"; then
             if [[ -s $bak ]]; then cp -p "$bak" "$RCLONE_CONFIG"; else rclone config delete "$BASE_REMOTE" 2>/dev/null; fi
             DEST_ROOT[$DEST]=$root
             save_config
@@ -1408,16 +1478,16 @@ ui_setup_remote() { # for the current destination
         rm -f "$bak"
         return
     fi
-    choice=$(menu "Select the method used to connect to $DEST_NAME:" \
-        G "Guided configuration (recommended)" \
-        M "Manual rclone configuration (special cases)") || return
+    choice=$(menu "$(t "Select the method used to connect to {1}:" "$DEST_NAME")" \
+        G "$(t "Guided configuration (recommended)")" \
+        M "$(t "Manual rclone configuration (special cases)")") || return
     case $choice in
     G)
-        remote_wizard || { msg "The $DEST_NAME connection was not completed. The previous configuration, if any, is unchanged."; return; }
+        remote_wizard || { msg "$(t "The {1} connection was not completed. The previous configuration, if any, is unchanged." "$DEST_NAME")"; return; }
         ;;
     M)
-        msg "The 'rclone config' tool will now open.\n\nCreate (n) a remote named exactly:\n\n    $BASE_REMOTE\n\nof type '${DEST_TYPES[$DEST]}', then quit (q)."
-        screen "Manual rclone configuration"
+        msg "$(t "The 'rclone config' tool will now open.\n\nCreate (n) a remote named exactly:\n\n    {1}\n\nof type '{2}', then quit (q)." "$BASE_REMOTE" "${DEST_TYPES[$DEST]}")"
+        screen "$(t "Manual rclone configuration")"
         rclone config
         chmod 600 "$RCLONE_CONFIG" 2>/dev/null
         ;;
@@ -1439,19 +1509,19 @@ dest_probe() {
     fi
     rclone lsf --max-depth 1 "$BASE_REMOTE:$root" "${opts[@]}" >/dev/null || return 1
     case $DEST in
-    s3) echo "The bucket '$root' is accessible." ;;
-    *) echo "The folder '${root:-(home folder)}' is accessible." ;;
+    s3) t "The bucket '{1}' is accessible." "$root" ;;
+    *) t "The folder '{1}' is accessible." "${root:-$(t "(home folder)")}" ;;
     esac
 }
 
 ui_test() {
     local out
-    has_remote "$BASE_REMOTE" || { msg "The $DEST_NAME connection is not configured."; return 1; }
-    busy "Testing the $DEST_NAME connection…"
+    has_remote "$BASE_REMOTE" || { msg "$(t "The {1} connection is not configured." "$DEST_NAME")"; return 1; }
+    busy "$(t "Testing the {1} connection…" "$DEST_NAME")"
     if out=$(dest_probe 2>&1); then
-        msg "The $DEST_NAME connection is operational.\n\n$out"
+        msg "$(t "The {1} connection is operational.\n\n{2}" "$DEST_NAME" "$out")"
     else
-        msg "The $DEST_NAME connection failed:\n\n$(tail -n 8 <<<"$out")"
+        msg "$(t "The {1} connection failed:\n\n{2}" "$DEST_NAME" "$(tail -n 8 <<<"$out")")"
         return 1
     fi
 }
@@ -1533,7 +1603,7 @@ migrate_names() {
         else
             cat "$err" >>"$LOG_FILE"
             rm -f "$err"
-            log "ERROR: $DEST_NAME could not be read; the file names were left unchanged"
+            log "ERROR: $(t "{1} could not be read; the file names were left unchanged" "$DEST_NAME")"
             return 1
         fi
     fi
@@ -1543,67 +1613,67 @@ migrate_names() {
         [[ -n $path ]] || continue
         enc=$(rclone cryptdecode --reverse "$CRYPT_REMOTE:" "$path" 2>>"$LOG_FILE" </dev/null |
             awk -F' \t ' '{print $2}')
-        [[ -n $enc ]] || { log "ERROR: no new name for $path"; failed=$((failed + 1)); continue; }
+        [[ -n $enc ]] || { log "ERROR: $(t "no new name for {1}" "$path")"; failed=$((failed + 1)); continue; }
         [[ $enc == "$old" ]] && continue
-        log "Renaming $path"
+        log "$(t "Renaming {1}" "$path")"
         if rclone moveto "$base/$old" "$base/$enc" --log-file "$LOG_FILE" --log-level NOTICE </dev/null; then
             n=$((n + 1))
         else
-            log "ERROR: $path could not be renamed (still stored as $old)"
+            log "ERROR: $(t "{1} could not be renamed (still stored as {2})" "$path" "$old")"
             failed=$((failed + 1))
         fi
     done < <(jq -r '.[] | [.Path, .EncryptedPath] | @tsv' <<<"$json")
     rclone rmdirs "$base" --leave-root 2>>"$LOG_FILE"
-    log "File names converted: $n file(s) renamed, $failed failure(s)."
+    log "$(t "File names converted: {1} file(s) renamed, {2} failure(s)." "$n" "$failed")"
     return "$failed"
 }
 
 ui_migrate_names() {
-    confirm "The backups on $DEST_NAME are stored under encrypted file names, as produced by an earlier version.\n\nThis version stores them under their original names followed by '.encrypted'. The existing backups can be renamed accordingly; their contents remain encrypted and nothing is uploaded again.\n\nDo you wish to convert them now?" || return
-    ui_run "Conversion of the file names on $DEST_NAME" op_locked migrate_names
+    confirm "$(t "The backups on {1} are stored under encrypted file names, as produced by an earlier version.\n\nThis version stores them under their original names followed by '.encrypted'. The existing backups can be renamed accordingly; their contents remain encrypted and nothing is uploaded again.\n\nDo you wish to convert them now?" "$DEST_NAME")" || return
+    ui_run "$(t "Conversion of the file names on {1}" "$DEST_NAME")" op_locked migrate_names
 }
 
 ui_setup_crypt() {
     local choice p1 p2
     if [[ -n $(obscured_passphrase) ]]; then
-        choice=$(CANCEL=Back menu "Encryption is configured. The same passphrase is used for every destination.\n\nThe contents of every file are encrypted (XSalsa20-Poly1305, 256-bit key). File names remain legible and carry the '.encrypted' suffix." \
-            S "Display the passphrase (to record it in a safe place)" \
-            C "Change the passphrase") || return
+        choice=$(CANCEL=Back menu "$(t "Encryption is configured. The same passphrase is used for every destination.\n\nThe contents of every file are encrypted (XSalsa20-Poly1305, 256-bit key). File names remain legible and carry the '.encrypted' suffix.")" \
+            S "$(t "Display the passphrase (to record it in a safe place)")" \
+            C "$(t "Change the passphrase")") || return
         case $choice in
         S)
-            msg "Encryption passphrase:\n\n$(current_passphrase)\n\nPlease keep it outside this server (password manager, printed copy). Without it, the backups cannot be recovered."
+            msg "$(t "Encryption passphrase:\n\n{1}\n\nPlease keep it outside this server (password manager, printed copy). Without it, the backups cannot be recovered." "$(current_passphrase)")"
             return
             ;;
         C)
-            confirm_no "Warning: the backups already uploaded were encrypted with the current passphrase. Once it is changed, this tool will no longer be able to read them unless the former passphrase is restored.\n\nDo you wish to continue?" || return
+            confirm_no "$(t "Warning: the backups already uploaded were encrypted with the current passphrase. Once it is changed, this tool will no longer be able to read them unless the former passphrase is restored.\n\nDo you wish to continue?")" || return
             ;;
         esac
     fi
-    choice=$(menu "Encryption passphrase\n\nThe passphrase protects the files uploaded to every destination. Restoring from another server requires exactly the same passphrase." \
-        G "Generate a strong random passphrase (recommended)" \
-        E "Enter a passphrase (a new one, or that of an existing installation)") || return
+    choice=$(menu "$(t "Encryption passphrase\n\nThe passphrase protects the files uploaded to every destination. Restoring from another server requires exactly the same passphrase.")" \
+        G "$(t "Generate a strong random passphrase (recommended)")" \
+        E "$(t "Enter a passphrase (a new one, or that of an existing installation)")") || return
     case $choice in
     G)
         p1=$(openssl rand -base64 33 | tr -d '\n')
         ;;
     E)
-        p1=$(password "Passphrase (at least 12 characters):") || return
-        p2=$(password "Confirm the passphrase:") || return
-        [[ $p1 == "$p2" ]] || { msg "The two entries do not match."; return; }
-        ((${#p1} >= 12)) || { msg "The passphrase is too short (at least 12 characters are required)."; return; }
+        p1=$(password "$(t "Passphrase (at least 12 characters):")") || return
+        p2=$(password "$(t "Confirm the passphrase:")") || return
+        [[ $p1 == "$p2" ]] || { msg "$(t "The two entries do not match.")"; return; }
+        ((${#p1} >= 12)) || { msg "$(t "The passphrase is too short (at least 12 characters are required).")"; return; }
         ;;
     esac
-    write_crypt_remote "$p1" || { msg "The encryption settings could not be saved."; return; }
+    write_crypt_remote "$p1" || { msg "$(t "The encryption settings could not be saved.")"; return; }
     save_config
-    msg "Encryption is configured.\n\nPassphrase:\n\n$p1\n\nPlease record it now, outside this server. Without it, no restore is possible should this server be lost."
+    msg "$(t "Encryption is configured.\n\nPassphrase:\n\n{1}\n\nPlease record it now, outside this server. Without it, no restore is possible should this server be lost." "$p1")"
 }
 
 ui_remote_dir() {
     local v id
-    v=$(input "Folder used on each destination (created if necessary).\n\nPlease note that existing backups are not moved." "$REMOTE_DIR") || return
+    v=$(input "$(t "Folder used on each destination (created if necessary).\n\nPlease note that existing backups are not moved.")" "$REMOTE_DIR") || return
     v=${v#/}
     v=${v%/}
-    [[ -n $v ]] || { msg "The folder name may not be empty."; return; }
+    [[ -n $v ]] || { msg "$(t "The folder name may not be empty.")"; return; }
     REMOTE_DIR=$v
     save_config
     for id in "${DEST_IDS[@]}"; do
@@ -1617,13 +1687,13 @@ ui_staging() {
     while read -r name stype status rest; do
         [[ $status == active && $stype =~ ^(dir|nfs|cifs|btrfs|cephfs)$ ]] || continue
         path=$(pvesh get "/storage/$name" --output-format json 2>/dev/null | jq -r '.path // empty')
-        [[ -n $path ]] && items+=("$path/dump" "storage $name — $(df -h --output=avail "$path" 2>/dev/null | tail -n1 | tr -d ' ') free")
+        [[ -n $path ]] && items+=("$path/dump" "$(t "storage {1} — {2} free" "$name" "$(df -h --output=avail "$path" 2>/dev/null | tail -n1 | tr -d ' ')")")
     done < <(pvesm status --content backup 2>/dev/null | tail -n +2)
-    items+=("other" "Enter another path")
-    v=$(menu "Local staging folder for vzdump\n\nEach archive is created there by vzdump, uploaded, then deleted. The folder must have enough free space for the largest backup.\n\nCurrent folder: $STAGING_DIR" "${items[@]}") || return
-    [[ $v == other ]] && { v=$(input "Staging folder path:" "$STAGING_DIR") || return; }
+    items+=("other" "$(t "Enter another path")")
+    v=$(menu "$(t "Local staging folder for vzdump\n\nEach archive is created there by vzdump, uploaded, then deleted. The folder must have enough free space for the largest backup.\n\nCurrent folder: {1}" "$STAGING_DIR")" "${items[@]}") || return
+    [[ $v == other ]] && { v=$(input "$(t "Staging folder path:")" "$STAGING_DIR") || return; }
     mkdir -p "$v" 2>/dev/null
-    [[ -d $v && -w $v ]] || { msg "The folder cannot be used: $v"; return; }
+    [[ -d $v && -w $v ]] || { msg "$(t "The folder cannot be used: {1}" "$v")"; return; }
     STAGING_DIR=$v
     save_config
 }
@@ -1631,30 +1701,30 @@ ui_staging() {
 ui_options() {
     local choice v
     while :; do
-        choice=$(CANCEL=Back menu "Backup options" \
-            M "vzdump mode: $VZDUMP_MODE" \
-            C "Compression: $COMPRESS" \
-            L "Upload rate limit: ${BWLIMIT:-none}" \
-            V "Verification after upload: $([[ $VERIFY == 1 ]] && echo enabled || echo disabled)") || return
+        choice=$(CANCEL=Back menu "$(t "Backup options")" \
+            M "$(t "vzdump mode: {1}" "$VZDUMP_MODE")" \
+            C "$(t "Compression: {1}" "$COMPRESS")" \
+            L "$(t "Upload rate limit: {1}" "${BWLIMIT:-$(t "none")}")" \
+            V "$(t "Verification after upload: {1}" "$([[ $VERIFY == 1 ]] && t "enabled" || t "disabled")")") || return
         case $choice in
         M)
-            v=$(menu "vzdump mode" \
-                snapshot "No interruption of service (recommended)" \
-                suspend "Brief suspension of the guest" \
-                stop "Guest stopped for the duration of the backup (highest consistency)") || continue
+            v=$(menu "$(t "vzdump mode")" \
+                snapshot "$(t "No interruption of service (recommended)")" \
+                suspend "$(t "Brief suspension of the guest")" \
+                stop "$(t "Guest stopped for the duration of the backup (highest consistency)")") || continue
             VZDUMP_MODE=$v
             ;;
         C)
-            v=$(menu "Compression" \
-                zstd "Fast, with a good compression ratio (recommended)" \
-                gzip "Widely compatible, slower" \
-                lzo "Very fast, lower compression ratio" \
-                0 "None") || continue
+            v=$(menu "$(t "Compression")" \
+                zstd "$(t "Fast, with a good compression ratio (recommended)")" \
+                gzip "$(t "Widely compatible, slower")" \
+                lzo "$(t "Very fast, lower compression ratio")" \
+                0 "$(t "None")") || continue
             COMPRESS=$v
             ;;
         L)
-            v=$(input "rclone rate limit (e.g. 10M = 10 MiB/s; empty = none):" "$BWLIMIT") || continue
-            [[ -z $v || $v =~ ^[0-9]+(\.[0-9]+)?[BKMG]?$ ]] || { msg "The format entered is not valid."; continue; }
+            v=$(input "$(t "rclone rate limit (e.g. 10M = 10 MiB/s; empty = none):")" "$BWLIMIT") || continue
+            [[ -z $v || $v =~ ^[0-9]+(\.[0-9]+)?[BKMG]?$ ]] || { msg "$(t "The format entered is not valid.")"; continue; }
             BWLIMIT=$v
             ;;
         V) VERIFY=$((1 - VERIFY)) ;;
@@ -1671,7 +1741,24 @@ ui_test_all() {
         use_dest "$id"
         ui_test
     done
-    ((found)) || msg "No connection is configured."
+    ((found)) || msg "$(t "No connection is configured.")"
+}
+
+ui_language() {
+    local items=() code choice
+    items=(auto "$(t "Language of the system")")
+    for code in "${LANG_CODES[@]}"; do
+        items+=("$code" "${LANG_NAMES[$code]}")
+    done
+    choice=$(menu "$(t "Select the language of the interface and of the log:")" "${items[@]}") || return
+    [[ $choice == auto ]] && choice=""
+    UI_LANG=$choice
+    save_config
+    load_language
+    use_dest "$DEST"
+    if [[ -n $choice && $choice != en && $CUR_LANG != "$choice" ]]; then
+        msg "The translation files were not found in $LANG_DIR; please run install.sh again."
+    fi
 }
 
 ui_config() {
@@ -1679,16 +1766,18 @@ ui_config() {
     while :; do
         items=()
         for i in "${!DEST_IDS[@]}"; do
-            items+=("$((i + 1))" "${DEST_NAMES[${DEST_IDS[$i]}]} connection: $(has_remote "${DEST_IDS[$i]}" && echo configured || echo "not configured")")
+            items+=("$((i + 1))" "$(t "{1} connection: {2}" "$(t "${DEST_NAMES[${DEST_IDS[$i]}]}")" "$(has_remote "${DEST_IDS[$i]}" && t "configured" || t "not configured")")")
         done
-        choice=$(CANCEL=Back menu "Configuration (stored in $CONF_DIR, readable by root only)" \
+        choice=$(CANCEL=Back menu "$(t "Configuration (stored in {1}, readable by root only)" "$CONF_DIR")" \
             "${items[@]}" \
-            E "Encryption: $([[ -n $(obscured_passphrase) ]] && echo configured || echo "not configured")" \
-            T "Test the connections" \
-            D "Folder on the destinations: $REMOTE_DIR" \
-            L "Local staging folder: $STAGING_DIR" \
-            S "Backup options") || return
+            E "$(t "Encryption: {1}" "$([[ -n $(obscured_passphrase) ]] && t "configured" || t "not configured")")" \
+            T "$(t "Test the connections")" \
+            D "$(t "Folder on the destinations: {1}" "$REMOTE_DIR")" \
+            L "$(t "Local staging folder: {1}" "$STAGING_DIR")" \
+            S "$(t "Backup options")" \
+            G "$(t "Language: {1}" "${LANG_NAMES[$CUR_LANG]}")") || return
         case $choice in
+        G) ui_language ;;
         E) ui_setup_crypt ;;
         T) ui_test_all ;;
         D) ui_remote_dir ;;
@@ -1762,9 +1851,9 @@ keepalive() {
         [[ -n ${DEST_TOKEN_LIFE[$d]:-} ]] || continue
         use_dest "$d"
         if out=$(rclone about "$BASE_REMOTE:" --retries 2 2>&1); then
-            log "$DEST_NAME token refreshed."
+            log "$(t "{1} token refreshed." "$DEST_NAME")"
         else
-            log "ERROR: the $DEST_NAME token could not be refreshed: $(tail -n 1 <<<"$out")"
+            log "ERROR: $(t "the {1} token could not be refreshed: {2}" "$DEST_NAME" "$(tail -n 1 <<<"$out")")"
             rc=1
         fi
     done
@@ -1784,28 +1873,34 @@ schedule_parse() {
     fi
 }
 
+# i18n: "Sunday" "Monday" "Tuesday" "Wednesday" "Thursday" "Friday" "Saturday"
 schedule_label() { # cron line -> readable label
-    local when what days=(Sunday Monday Tuesday Wednesday Thursday Friday Saturday)
+    local when what time days=(Sunday Monday Tuesday Wednesday Thursday Friday Saturday)
     schedule_parse "$1"
-    if [[ $S_DOW == "*" ]]; then when="Daily"; else when="Every ${days[S_DOW]}"; fi
-    if [[ $S_TARGETS == --all ]]; then what="all guests"; else what="guests $S_TARGETS"; fi
-    printf '%s at %02d:%02d, %s, to %s' "$when" "$S_HOUR" "$S_MIN" "$what" "$(dest_label "$S_DEST")"
+    printf -v time '%02d:%02d' "$S_HOUR" "$S_MIN"
+    if [[ $S_DOW == "*" ]]; then
+        when=$(t "Daily at {1}" "$time")
+    else
+        when=$(t "Weekly on {1} at {2}" "$(t "${days[S_DOW]}")" "$time")
+    fi
+    if [[ $S_TARGETS == --all ]]; then what=$(t "all guests"); else what=$(t "guests {1}" "$S_TARGETS"); fi
+    t "{1}, {2}, to {3}" "$when" "$what" "$(dest_label "$S_DEST")"
 }
 
 # Runs a schedule at once, exactly as cron would, with the progress on screen
 ui_schedule_run() { # cron line
     local ids err
     schedule_parse "$1"
-    err=$(set_dests "$S_DEST") || { msg "This schedule cannot be run: $err."; return; }
+    err=$(set_dests "$S_DEST") || { msg "$(t "This schedule cannot be run: {1}." "$err")"; return; }
     set_dests "$S_DEST"
     ids=$S_TARGETS
     if [[ $ids == --all ]]; then
         ids=$(guest_list | cut -f1 | tr '\n' ' ')
-        [[ -n ${ids// /} ]] || { msg "No virtual machine or container was found on this node."; return; }
+        [[ -n ${ids// /} ]] || { msg "$(t "No virtual machine or container was found on this node.")"; return; }
     fi
-    confirm "Run the following schedule now?\n\n$(schedule_label "$1")\n\nThe schedule itself is not modified." || return
+    confirm "$(t "Run the following schedule now?\n\n{1}\n\nThe schedule itself is not modified." "$(schedule_label "$1")")" || return
     # shellcheck disable=SC2086
-    ui_run "Backup" backup_guests $ids
+    ui_run "$(t "Backup")" backup_guests $ids
 }
 
 ui_schedule_add() {
@@ -1813,20 +1908,20 @@ ui_schedule_add() {
     pick_dests || return
     dest=$(IFS=,; echo "${DESTS[*]}")
 
-    choice=$(menu "Frequency of the backup" \
-        D "Daily" \
-        W "Weekly") || return
+    choice=$(menu "$(t "Frequency of the backup")" \
+        D "$(t "Daily")" \
+        W "$(t "Weekly")") || return
     if [[ $choice == W ]]; then
-        dow=$(menu "Select the day of the week:" 1 Monday 2 Tuesday 3 Wednesday 4 Thursday 5 Friday 6 Saturday 0 Sunday) || return
+        dow=$(menu "$(t "Select the day of the week:")" 1 "$(t "Monday")" 2 "$(t "Tuesday")" 3 "$(t "Wednesday")" 4 "$(t "Thursday")" 5 "$(t "Friday")" 6 "$(t "Saturday")" 0 "$(t "Sunday")") || return
     fi
-    time=$(input "Start time (HH:MM, 24-hour clock):" "02:00") || return
-    [[ $time =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]] || { msg "The time entered is not valid."; return; }
+    time=$(input "$(t "Start time (HH:MM, 24-hour clock):")" "02:00") || return
+    [[ $time =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]] || { msg "$(t "The time entered is not valid.")"; return; }
     hour=$((10#${BASH_REMATCH[1]}))
     min=$((10#${BASH_REMATCH[2]}))
 
-    choice=$(menu "Guests included in this schedule" \
-        A "All guests on the node, including those added later" \
-        S "Selected guests only") || return
+    choice=$(menu "$(t "Guests included in this schedule")" \
+        A "$(t "All guests on the node, including those added later")" \
+        S "$(t "Selected guests only")") || return
     if [[ $choice == A ]]; then
         targets="--all"
     else
@@ -1834,9 +1929,9 @@ ui_schedule_add() {
         while IFS=$'\t' read -r id type name status; do
             [[ -n $id ]] && items+=("$id" "$(printf '%-4s %s' "$type" "$name")" OFF)
         done < <(guest_list)
-        ((${#items[@]})) || { msg "No virtual machine or container was found on this node."; return; }
-        sel=$(checklist "Select the guests to back up (Space to select, Enter to confirm)." "${items[@]}") || return
-        [[ -n $sel ]] || { msg "No guest was selected; the schedule was not created."; return; }
+        ((${#items[@]})) || { msg "$(t "No virtual machine or container was found on this node.")"; return; }
+        sel=$(checklist "$(t "Select the guests to back up (Space to select, Enter to confirm).")" "${items[@]}") || return
+        [[ -n $sel ]] || { msg "$(t "No guest was selected; the schedule was not created.")"; return; }
         targets=$(tr '\n' ' ' <<<"$sel")
         targets=${targets% }
     fi
@@ -1845,22 +1940,22 @@ ui_schedule_add() {
     line="$min $hour * * $dow root $self backup --to $dest $targets >/dev/null 2>&1"
     load_schedules
     for id in "${SCHEDULES[@]}"; do
-        [[ $id == "$line" ]] && { msg "An identical schedule already exists."; return; }
+        [[ $id == "$line" ]] && { msg "$(t "An identical schedule already exists.")"; return; }
     done
     SCHEDULES+=("$line")
     save_schedules
-    msg "The schedule has been saved:\n\n$(schedule_label "$line")\n\nProgress is recorded in $LOG_FILE."
+    msg "$(t "The schedule has been saved:\n\n{1}\n\nProgress is recorded in {2}." "$(schedule_label "$line")" "$LOG_FILE")"
 }
 
 ui_schedule() {
     local choice items i label
     while :; do
         load_schedules
-        items=(A "Add a schedule")
+        items=(A "$(t "Add a schedule")")
         for i in "${!SCHEDULES[@]}"; do
             items+=("$((i + 1))" "$(schedule_label "${SCHEDULES[$i]}")")
         done
-        choice=$(CANCEL=Back menu "Automatic backups (cron): ${#SCHEDULES[@]} schedule(s) defined.\n\nSelect a schedule to run it now or to remove it, or add a new one. Schedules that overlap are run one after the other." "${items[@]}") || return
+        choice=$(CANCEL=Back menu "$(t "Automatic backups (cron): {1} schedule(s) defined.\n\nSelect a schedule to run it now or to remove it, or add a new one. Schedules that overlap are run one after the other." "${#SCHEDULES[@]}")" "${items[@]}") || return
         if [[ $choice == A ]]; then
             ui_schedule_add
             continue
@@ -1868,12 +1963,12 @@ ui_schedule() {
         i=$((choice - 1))
         label=$(schedule_label "${SCHEDULES[$i]}")
         choice=$(CANCEL=Back menu "$label" \
-            R "Run this schedule now" \
-            D "Remove this schedule") || continue
+            R "$(t "Run this schedule now")" \
+            D "$(t "Remove this schedule")") || continue
         case $choice in
         R) ui_schedule_run "${SCHEDULES[$i]}" ;;
         D)
-            confirm_no "Remove the following schedule?\n\n$label" || continue
+            confirm_no "$(t "Remove the following schedule?\n\n{1}" "$label")" || continue
             unset "SCHEDULES[$i]"
             SCHEDULES=("${SCHEDULES[@]}")
             save_schedules
@@ -1884,10 +1979,10 @@ ui_schedule() {
 
 ui_log() {
     local tmp
-    [[ -s $LOG_FILE ]] || { msg "The log is empty."; return; }
+    [[ -s $LOG_FILE ]] || { msg "$(t "The log is empty.")"; return; }
     tmp=$(mktemp)
     tail -n 300 "$LOG_FILE" >"$tmp"
-    textbox "$TITLE — $LOG_FILE (last 300 lines)" "$tmp"
+    textbox "$(t "{1} — {2} (last 300 lines)" "$TITLE" "$LOG_FILE")" "$tmp"
     rm -f "$tmp"
 }
 
@@ -1896,20 +1991,20 @@ main_menu() {
     local id
     ensure_crypt
     if [[ -z $(dest_list) ]]; then
-        msg "proxdump has not been configured yet.\n\nBefore the first backup, please open the 'Configuration' menu in order to:\n\n  1. connect at least one destination;\n  2. define the encryption passphrase;\n  3. select the local staging folder for vzdump."
+        msg "$(t "proxdump has not been configured yet.\n\nBefore the first backup, please open the 'Configuration' menu in order to:\n\n  1. connect at least one destination;\n  2. define the encryption passphrase;\n  3. select the local staging folder for vzdump.")"
     fi
     for id in $(dest_list | cut -f1); do
         use_dest "$id"
         names_plain || ui_migrate_names
     done
     while :; do
-        choice=$(CANCEL=Quit menu "Encrypted backup of Proxmox VE to cloud storage (node: $(hostname -s))" \
-            1 "Back up virtual machines and containers" \
-            2 "Restore a backup" \
-            3 "Manage the stored backups" \
-            4 "Automatic scheduling" \
-            5 "Configuration" \
-            6 "Log") || break
+        choice=$(CANCEL=Quit menu "$(t "Encrypted backup of Proxmox VE to cloud storage (node: {1})" "$(hostname -s)")" \
+            1 "$(t "Back up virtual machines and containers")" \
+            2 "$(t "Restore a backup")" \
+            3 "$(t "Manage the stored backups")" \
+            4 "$(t "Automatic scheduling")" \
+            5 "$(t "Configuration")" \
+            6 "$(t "Log")") || break
         case $choice in
         1) ui_backup ;;
         2) ui_restore ;;
@@ -1949,7 +2044,7 @@ main() {
     -h | --help) usage; exit 0 ;;
     --version) echo "$VERSION"; exit 0 ;;
     esac
-    ((EUID == 0)) || die "proxdump must be run as root."
+    ((EUID == 0)) || die "$(t "proxdump must be run as root.")"
     check_deps
     load_config
 
@@ -1957,7 +2052,7 @@ main() {
     if [[ -n $cmd ]]; then
         shift
         if [[ ${1:-} == --to ]]; then
-            [[ -n ${2:-} ]] || die "--to requires a destination."
+            [[ -n ${2:-} ]] || die "$(t "--to requires a destination.")"
             err=$(set_dests "$2") || die "$err."
             set_dests "$2"
             shift 2
@@ -1968,16 +2063,16 @@ main() {
     fi
     case $cmd in
     "")
-        [[ -t 0 && -t 1 ]] || die "the menus need a terminal; see --help."
+        [[ -t 0 && -t 1 ]] || die "$(t "the menus need a terminal; see --help.")"
         main_menu
         ;;
     backup)
-        (($#)) || die "specify --all or at least one ID."
+        (($#)) || die "$(t "specify --all or at least one ID.")"
         # a run started while another one is in progress waits for its turn
         LOCK_WAIT=43200
         if [[ $1 == --all ]]; then
             ids=$(guest_list | cut -f1 | tr '\n' ' ')
-            [[ -n ${ids// /} ]] || die "no guests on this node."
+            [[ -n ${ids// /} ]] || die "$(t "no guests on this node.")"
         else
             ids="$*"
         fi

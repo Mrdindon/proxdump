@@ -7,6 +7,7 @@ set -euo pipefail
 
 BIN=/usr/local/bin/proxdump
 CONF_DIR=/etc/proxdump
+SHARE_DIR=/usr/local/share/proxdump
 RCLONE_MIN="1.65"
 SRC_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
@@ -14,6 +15,7 @@ SRC_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 if [[ ${1:-} == --uninstall ]]; then
     rm -f "$BIN" /etc/cron.d/proxdump
+    rm -rf "$SHARE_DIR"
     echo "proxdump removed."
     echo "Kept on purpose: $CONF_DIR (credentials, passphrase) and /var/log/proxdump.log."
     echo "To erase everything: rm -rf $CONF_DIR /var/log/proxdump.log"
@@ -52,6 +54,9 @@ if ! rclone_ok; then
 fi
 
 install -m 755 "$SRC_DIR/proxdump" "$BIN"
+# translations of the interface (English is built in)
+install -d -m 755 "$SHARE_DIR/lang"
+install -m 644 "$SRC_DIR"/lang/*.sh "$SHARE_DIR/lang/"
 install -d -m 700 "$CONF_DIR"
 
 echo

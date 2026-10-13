@@ -15,7 +15,8 @@ Wasabi, Amazon S3, MinIO…) or an **SFTP server**, driven by `whiptail` menus.
 - manages the backups already uploaded: list, delete, number of versions
   kept (global or per guest);
 - restores under the original ID, under a new ID, or simply downloads;
-- cron scheduling and non-interactive subcommands.
+- cron scheduling and non-interactive subcommands;
+- interface and log in English, French, Spanish, German, Chinese or Russian.
 
 ```
 ┌───────────────────────── proxdump 1.0.0 ──────────────────────────┐
@@ -396,6 +397,21 @@ the sole purpose of renewing the token. It transfers no data and records
 its result in the log. The option only appears for OneDrive and Google
 Drive. Neither provider lets the remaining lifetime of a token be queried.
 
+### Language
+
+The interface and the log follow the language of the system (`LANG`) when it
+is one of English, French, Spanish, German, Chinese (simplified) or Russian,
+and fall back to English otherwise. **Configuration → Language** selects
+another one; the choice also applies to the scheduled backups. The
+`PROXDUMP_LANG` environment variable (`en`, `fr`, `es`, `de`, `zh`, `ru`)
+overrides both for one run.
+
+The command-line help, the installer and this documentation are in English.
+In the Google Drive instructions, the names of the Google console menus are
+given in English whatever the language. Chinese and Russian need a terminal
+whose font has those characters, which rules out the physical console of the
+server.
+
 ### 2. Encryption
 
 A single passphrase protects every destination.
@@ -592,6 +608,7 @@ succeeded). A lock prevents two operations from running at the same time:
 | `/etc/proxdump/sftp_key` | **Private SSH key** used for the SFTP server | 600 |
 | `/etc/proxdump/sftp_known_hosts` | Host keys of the SFTP server | 600 |
 | `/etc/proxdump/config` | Settings (no secrets) | 600 |
+| `/usr/local/share/proxdump/lang/` | Translations of the interface | 644 |
 | `/etc/cron.d/proxdump` | Schedules and daily token refreshes | 644 |
 | `/var/log/proxdump.log` | Operations log | — |
 
@@ -640,7 +657,6 @@ The details of each operation (`vzdump` and `rclone` output) are in
 - Local space for the compressed archive is needed, for backup as well as
   for restore.
 - Restore only exists in the menus (no subcommand).
-- The interface is in English only for now.
 
 ## Development and testing
 
@@ -655,6 +671,22 @@ mkdir -p /tmp/odp/conf /tmp/odp/fake-onedrive
 printf '[onedrive]\ntype = alias\nremote = /tmp/odp/fake-onedrive\n' > /tmp/odp/conf/rclone.conf
 ./proxdump      # then Configuration → Encryption, and a trial backup
 ```
+
+### Translations
+
+English is the source language: the messages are written in English in
+`proxdump`, wrapped in the function `t`, and each `lang/<code>.sh` holds
+their translations, one `_m 'English' 'translation'` line per message. A
+message without translation is displayed in English.
+
+```bash
+tools/i18n.py list     # numbered list of the messages found in proxdump
+tools/i18n.py check    # missing and obsolete entries of each catalogue
+```
+
+After adding or changing a message, run `tools/i18n.py check` and complete
+the catalogues it reports. The translations were not reviewed by native
+speakers: corrections are welcome.
 
 ## License
 
