@@ -615,12 +615,20 @@ screen() { # heading
 # text, XXX) and keeps the window up to date; the spinner turns meanwhile,
 # and the window follows the size of the terminal.
 _gauge_loop() {
-    local heading=$1 line pct=0 state=0 spin=0 fill bw bar start=$SECONDS rc resized=1
+    local heading=$1 line part="" pct=0 state=0 spin=0 fill bw bar start=$SECONDS rc resized=1
     local -a txt=("$heading" "" "" "") buf=()
     trap 'resized=1' WINCH
     while :; do
         IFS= read -r -t 0.12 line
         rc=$?
+        # a timeout may fall in the middle of a line: what was read is kept
+        # and completed by the next read
+        if ((rc > 128)); then
+            part+=$line
+        elif ((rc == 0)); then
+            line=$part$line
+            part=""
+        fi
         if ((rc == 0)); then
             if [[ $line == XXX ]]; then
                 if ((state)); then

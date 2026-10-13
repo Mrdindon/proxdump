@@ -5,7 +5,7 @@
 # Pipeline: vzdump (temporary local archive) -> rclone crypt -> destination(s)
 # Interface: whiptail menus, or non-interactive subcommands (cron).
 #
-# MIT License — see LICENSE.
+# SPDX-License-Identifier: AGPL-3.0-or-later — see LICENSE.
 
 set -u
 set -o pipefail
@@ -49,9 +49,11 @@ LANG_DIR="${PROXDUMP_LANG_DIR:-}"
 if [[ -z $LANG_DIR ]]; then
     LANG_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lang"
     [[ -d $LANG_DIR ]] || LANG_DIR=/usr/local/share/proxdump/lang
+    [[ -d $LANG_DIR ]] || LANG_DIR=/usr/share/proxdump/lang
 fi
 LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib"
 [[ -d $LIB_DIR ]] || LIB_DIR=/usr/local/share/proxdump/lib
+[[ -d $LIB_DIR ]] || LIB_DIR=/usr/share/proxdump/lib
 CUR_LANG=en
 declare -A T=()
 _m() { T[$1]=$2; }
@@ -719,7 +721,7 @@ gauge_start() { # heading
 }
 
 _gauge_relay() { # heading; the protocol of 'whiptail --gauge' on its input
-    local heading=$1 line state=0 resized=0 rc w wpid l
+    local heading=$1 line part="" state=0 resized=0 rc w wpid l
     local -a block=() last=()
     trap 'resized=1' WINCH
     _start() {
@@ -754,9 +756,13 @@ _gauge_relay() { # heading; the protocol of 'whiptail --gauge' on its input
             ((${#last[@]})) && _send
         fi
         if ((rc)); then
-            ((rc > 128)) && continue
+            # a timeout may fall in the middle of a line: what was read is
+            # kept and completed by the next read
+            ((rc > 128)) && { part+=$line; continue; }
             break # end of the input: the operation is over
         fi
+        line=$part$line
+        part=""
         if [[ $line == XXX ]]; then
             if ((state)); then
                 last=("${block[@]}")
