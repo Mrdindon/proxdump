@@ -140,6 +140,15 @@ La documentation détaillée est en anglais :
 - Les traductions n'ont pas été relues par des locuteurs natifs : les
   corrections sont bienvenues.
 
+## Comment il a été fait
+
+proxdump a été écrit avec [Claude Code](https://claude.com/claude-code),
+l'agent de programmation d'Anthropic, dirigé et relu par l'auteur, et testé
+sur un vrai nœud Proxmox VE (voir
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)). Les notes de conception et les
+leçons apprises sont dans la même page ; [AGENTS.md](AGENTS.md) est le guide
+donné aux agents de code qui y travaillent.
+
 ## Licence
 
 [AGPL-3.0-or-later](LICENSE).

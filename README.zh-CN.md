@@ -116,6 +116,13 @@ proxdump prune                            # 应用保留策略
 - 备份和恢复时都需要本地空间来存放压缩后的归档。
 - 翻译未经母语人士审校，欢迎指正。
 
+## 开发方式
+
+proxdump 使用 Anthropic 的 AI 编程代理 [Claude Code](https://claude.com/claude-code)
+编写，由作者指导和审查，并在真实的 Proxmox VE 节点上测试（参见
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)）。设计说明和经验总结也在该页面中；
+[AGENTS.md](AGENTS.md) 是提供给参与开发的编程代理的指南。
+
 ## 许可证
 
 [AGPL-3.0-or-later](LICENSE)。
