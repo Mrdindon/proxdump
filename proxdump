@@ -10,7 +10,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 TITLE="proxdump $VERSION"
 
 CONF_DIR="${PROXDUMP_CONF_DIR:-/etc/proxdump}"
@@ -155,6 +155,7 @@ cleanup() {
         [[ -n $d && -d $d ]] && rm -rf -- "$d"
     done
     declare -F tui_leave >/dev/null && tui_leave
+    kbd_restore
     return 0
 }
 trap cleanup EXIT
@@ -614,8 +615,18 @@ backup_guests() { # vmid…
 
 # --- whiptail interface ------------------------------------------------------
 
+# Keys typed while an operation runs are neither echoed nor handed to the
+# next dialog: the menus keep the echo off, and each dialog first discards
+# what is waiting. Only the plain terminal (screen) echoes again.
+TTY_STTY=""
+kbd_hush() { stty -echo -icanon </dev/tty 2>/dev/null; return 0; }
+kbd_drain() { while read -r -s -n 1 -t 0.01 _ </dev/tty 2>/dev/null; do :; done; return 0; }
+kbd_restore() { [[ -n $TTY_STTY ]] && stty "$TTY_STTY" </dev/tty 2>/dev/null; return 0; }
+
 dims() {
     local rows cols
+    kbd_drain
+    kbd_hush
     read -r rows cols < <(stty size </dev/tty 2>/dev/null || echo "24 80")
     H=$((rows - 4)); ((H > 30)) && H=30; ((H < 16)) && H=16
     W=$((cols - 6)); ((W > 100)) && W=100; ((W < 60)) && W=60
@@ -818,6 +829,8 @@ busy() {
 # A few steps need the plain terminal, because text has to be copied from it
 # or pasted into it: the authorization command and its token, an SSH key.
 screen() { # heading
+    kbd_restore
+    kbd_drain
     clear
     printf '\033[1m%s — %s\033[0m\n\n' "$TITLE" "$1"
 }
@@ -1397,12 +1410,16 @@ remote_wizard() {
         return 1
     }
     rclone config delete "$BASE_REMOTE" 2>/dev/null
+    busy "$(t "Contacting {1}…" "$DEST_NAME")"
     out=$(rclone config create "$BASE_REMOTE" "${DEST_TYPES[$DEST]}" config_is_local=false "${args[@]}" --non-interactive 2>"$err")
     while :; do
         state=$(jq -r '.State // ""' <<<"$out" 2>/dev/null)
+        # after an error rclone would go on with questions meant for experts
+        # (a drive ID to type in…): the connection is abandoned instead
         if [[ -z $out || $(jq -r '.Error // ""' <<<"$out" 2>/dev/null) != "" ]]; then
-            msg "$(t "rclone reported an error:\n\n{1}\n{2}" "$(jq -r '.Error // ""' <<<"$out" 2>/dev/null)" "$(grep -i 'error' "$err" | tail -n 3)")"
-            [[ -z $state ]] && { wizard_abort; return 1; }
+            msg "$(t "rclone reported an error:\n\n{1}\n{2}" "$(jq -r '.Error // ""' <<<"$out" 2>/dev/null | grep -v 'manually instead')" "$(grep -i 'error' "$err" | tail -n 3)")"
+            wizard_abort
+            return 1
         fi
         [[ -z $state ]] && break
         qname=$(jq -r '.Option.Name' <<<"$out")
@@ -1475,6 +1492,7 @@ EOT
         else
             result=$(input "$help" "$def") || { wizard_abort; return 1; }
         fi
+        busy "$(t "Contacting {1}…" "$DEST_NAME")"
         out=$(rclone config update "$BASE_REMOTE" --continue --state "$state" --result "$result" --non-interactive 2>"$err")
     done
     rm -f "$err" "$bak"
@@ -2034,8 +2052,51 @@ ui_schedule_run() { # cron line
     ui_run "$(t "Backup")" backup_guests $ids
 }
 
+# Asks which guests a schedule includes and prints them: '--all' or a list
+# of IDs. The guests of the current choice, if given, are ticked; those that
+# are no longer on the node stay in the list, so that they can be removed.
+schedule_guests() { # current targets
+    local items=() id type name status sel cur=" ${1:-} " seen=" " choice
+    choice=$(menu "$(t "Guests included in this schedule")" \
+        A "$(t "All guests on the node, including those added later")" \
+        S "$(t "Selected guests only")") || return 1
+    if [[ $choice == A ]]; then
+        echo "--all"
+        return 0
+    fi
+    [[ $cur == " --all " ]] && cur=" "
+    while IFS=$'\t' read -r id type name status; do
+        [[ -n $id ]] || continue
+        items+=("$id" "$(printf '%-4s %s' "$type" "$name")" "$([[ $cur == *" $id "* ]] && echo ON || echo OFF)")
+        seen+="$id "
+    done < <(guest_list)
+    for id in $cur; do
+        [[ $seen == *" $id "* ]] || items+=("$id" "$(t "not found on this node")" ON)
+    done
+    ((${#items[@]})) || { msg "$(t "No virtual machine or container was found on this node.")"; return 1; }
+    sel=$(checklist "$(t "Select the guests to back up (Space to select, Enter to confirm).")" "${items[@]}") || return 1
+    [[ -n $sel ]] || { msg "$(t "No guest was selected.")"; return 1; }
+    sel=$(tr '\n' ' ' <<<"$sel")
+    echo "${sel% }"
+}
+
+# Replaces the guests of a schedule; when, where and how stay the same
+ui_schedule_guests() { # index in SCHEDULES
+    local line=${SCHEDULES[$1]} targets new i
+    schedule_parse "$line"
+    targets=$(schedule_guests "$S_TARGETS") || return
+    [[ $targets == "$S_TARGETS" ]] && return
+    new="${line%% backup *} backup ${S_DEST:+--to $S_DEST }$targets >/dev/null 2>&1"
+    for i in "${!SCHEDULES[@]}"; do
+        [[ ${SCHEDULES[$i]} == "$new" ]] && { msg "$(t "An identical schedule already exists.")"; return; }
+    done
+    SCHEDULES[$1]=$new
+    save_schedules
+    msg "$(t "The schedule has been saved:\n\n{1}\n\nProgress is recorded in {2}." "$(schedule_label "$new")" "$LOG_FILE")"
+}
+
 ui_schedule_add() {
-    local items=() id dest choice dow="*" time hour min type name status sel targets self line
+    local id dest choice dow="*" time hour min targets self line
     pick_dests || return
     dest=$(IFS=,; echo "${DESTS[*]}")
 
@@ -2050,22 +2111,7 @@ ui_schedule_add() {
     hour=$((10#${BASH_REMATCH[1]}))
     min=$((10#${BASH_REMATCH[2]}))
 
-    choice=$(menu "$(t "Guests included in this schedule")" \
-        A "$(t "All guests on the node, including those added later")" \
-        S "$(t "Selected guests only")") || return
-    if [[ $choice == A ]]; then
-        targets="--all"
-    else
-        items=()
-        while IFS=$'\t' read -r id type name status; do
-            [[ -n $id ]] && items+=("$id" "$(printf '%-4s %s' "$type" "$name")" OFF)
-        done < <(guest_list)
-        ((${#items[@]})) || { msg "$(t "No virtual machine or container was found on this node.")"; return; }
-        sel=$(checklist "$(t "Select the guests to back up (Space to select, Enter to confirm).")" "${items[@]}") || return
-        [[ -n $sel ]] || { msg "$(t "No guest was selected; the schedule was not created.")"; return; }
-        targets=$(tr '\n' ' ' <<<"$sel")
-        targets=${targets% }
-    fi
+    targets=$(schedule_guests) || return
 
     self=$(self_path)
     line="$min $hour * * $dow root $self backup --to $dest $targets >/dev/null 2>&1"
@@ -2086,7 +2132,7 @@ ui_schedule() {
         for i in "${!SCHEDULES[@]}"; do
             items+=("$((i + 1))" "$(schedule_label "${SCHEDULES[$i]}")")
         done
-        choice=$(CANCEL=Back menu "$(t "Automatic backups (cron): {1} schedule(s) defined.\n\nSelect a schedule to run it now or to remove it, or add a new one. Schedules that overlap are run one after the other." "${#SCHEDULES[@]}")" "${items[@]}") || return
+        choice=$(CANCEL=Back menu "$(t "Automatic backups (cron): {1} schedule(s) defined.\n\nSelect a schedule to run it now, to change its guests or to remove it, or add a new one. Schedules that overlap are run one after the other." "${#SCHEDULES[@]}")" "${items[@]}") || return
         if [[ $choice == A ]]; then
             ui_schedule_add
             continue
@@ -2095,9 +2141,11 @@ ui_schedule() {
         label=$(schedule_label "${SCHEDULES[$i]}")
         choice=$(CANCEL=Back menu "$label" \
             R "$(t "Run this schedule now")" \
+            G "$(t "Change the guests included")" \
             D "$(t "Remove this schedule")") || continue
         case $choice in
         R) ui_schedule_run "${SCHEDULES[$i]}" ;;
+        G) ui_schedule_guests "$i" ;;
         D)
             confirm_no "$(t "Remove the following schedule?\n\n{1}" "$label")" || continue
             unset "SCHEDULES[$i]"
@@ -2148,6 +2196,63 @@ main_menu() {
     if declare -F tui_leave >/dev/null; then tui_leave; else clear; fi
 }
 
+# --- Update ------------------------------------------------------------------
+
+PROJECT_REPO="Mrdindon/proxdump"
+
+# Installs the latest release published on GitHub if it is newer than this
+# one, the way this copy was installed: the Debian package (checked against
+# the digest GitHub publishes), or the archive of the release and its
+# install.sh. A copy run from a git clone is left to git.
+update() { # [--check]
+    local self dir rel tag latest pkg asset url digest tmp
+    self=$(readlink -f "${BASH_SOURCE[0]}")
+    dir=$(dirname "$self")
+    rel=$(curl -fsSL --max-time 30 "https://api.github.com/repos/$PROJECT_REPO/releases/latest") ||
+        die "$(t "the latest version could not be obtained from GitHub.")"
+    tag=$(jq -r '.tag_name // ""' <<<"$rel")
+    latest=${tag#v}
+    [[ $latest =~ ^[0-9][0-9.]*$ ]] || die "$(t "the latest version could not be obtained from GitHub.")"
+    if dpkg --compare-versions "$latest" le "$VERSION"; then
+        t "proxdump {1} is up to date." "$VERSION"
+        return 0
+    fi
+    t "proxdump {1} is available (installed: {2})." "$latest" "$VERSION"
+    [[ ${1:-} == --check ]] && return 0
+
+    if git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        t "This copy runs from a git clone ({1}): update it with 'git pull'." "$dir"
+        return 1
+    fi
+    # the files are not replaced under a backup or a restore
+    acquire_lock || return 1
+    tmp=$(mktemp -d)
+    CLEANUP_DIRS+=("$tmp")
+    pkg=$(dpkg -S "$self" 2>/dev/null | cut -d: -f1)
+    if [[ -n $pkg ]]; then
+        asset=$(jq -c '[.assets[] | select(.name | endswith("_all.deb"))][0] // empty' <<<"$rel")
+        [[ -n $asset ]] || die "$(t "the release {1} has no Debian package." "$tag")"
+        url=$(jq -r '.browser_download_url' <<<"$asset")
+        digest=$(jq -r '.digest // "" | ltrimstr("sha256:")' <<<"$asset")
+        t "Downloading {1}…" "${url##*/}"
+        curl -fsSL --max-time 300 -o "$tmp/${url##*/}" "$url" || die "$(t "the download failed.")"
+        if [[ -n $digest ]]; then
+            [[ $(sha256sum "$tmp/${url##*/}" | cut -d' ' -f1) == "$digest" ]] ||
+                die "$(t "the downloaded file does not match the checksum published by GitHub; nothing was installed.")"
+        fi
+        apt-get install -y "$tmp/${url##*/}" || die "$(t "the installation failed.")"
+    else
+        url="https://github.com/$PROJECT_REPO/archive/refs/tags/$tag.tar.gz"
+        t "Downloading {1}…" "$PROJECT_REPO $tag"
+        curl -fsSL --max-time 300 "$url" | tar -xz -C "$tmp" --strip-components=1 ||
+            die "$(t "the download failed.")"
+        [[ -f $tmp/install.sh ]] || die "$(t "the download failed.")"
+        bash "$tmp/install.sh" || die "$(t "the installation failed.")"
+    fi
+    release_lock
+    log "$(t "proxdump updated from {1} to {2}." "$VERSION" "$latest")"
+}
+
 # --- Command line ------------------------------------------------------------
 
 usage() {
@@ -2161,6 +2266,7 @@ Usage:
   proxdump list [--to DEST]              list the stored backups
   proxdump prune [--to DEST]             apply retention
   proxdump keepalive [--to DEST]         renew the access tokens that can lapse
+  proxdump update [--check]              install the latest release, if newer
   proxdump --version | --help
 
 DEST is one or more destinations separated by commas: ${DEST_IDS[*]}.
@@ -2178,6 +2284,9 @@ main() {
     ((EUID == 0)) || die "$(t "proxdump must be run as root.")"
     check_deps
     load_config
+    case ${1:-} in
+    update | -update | --update) shift; update "$@"; exit ;;
+    esac
 
     local ids line cmd=${1:-} err d
     if [[ -n $cmd ]]; then
@@ -2195,12 +2304,14 @@ main() {
     case $cmd in
     "")
         [[ -t 0 && -t 1 ]] || die "$(t "the menus need a terminal; see --help.")"
+        TTY_STTY=$(stty -g </dev/tty 2>/dev/null)
         # dialogs drawn by the tool itself instead of whiptail
         if [[ ${PROXDUMP_UI:-$UI_STYLE} == native && -r $LIB_DIR/tui.sh ]]; then
             # shellcheck disable=SC1091
             source "$LIB_DIR/tui.sh"
             tui_enter
         fi
+        kbd_hush
         main_menu
         ;;
     backup)

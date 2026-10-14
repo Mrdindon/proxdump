@@ -56,6 +56,11 @@ real S3 providers and real SSH servers.
   key.** Ctrl-C does nothing behind a gauge until `stty isig intr '^C'` is
   run after it has started. It also does not follow a change of size: the
   gauge is restarted by a relay.
+- **Keys typed during an operation wait for the next dialog.** Between two
+  dialogs the terminal is in its normal mode: the keys were echoed over the
+  window, then taken by the next menu as choices. The menus now keep the
+  echo off (`kbd_hush`), every dialog first discards what is waiting
+  (`kbd_drain`), and only `screen` turns the echo on again.
 - **`stty size` reads its standard input.** In a process that reads a pipe
   it must be given `</dev/tty`, otherwise the size falls back to 80×24.
 - **bash 5.2 treats `&` in the replacement of `${var//pattern/text}` as the

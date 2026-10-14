@@ -94,6 +94,7 @@ proxdump backup --all                     # 所有客户机，所有目标
 proxdump backup --to s3,onedrive 100 101  # 指定的客户机和目标
 proxdump list                             # 已存储的备份
 proxdump prune                            # 应用保留策略
+proxdump update                           # 安装最新版本
 ```
 
 ## 文档

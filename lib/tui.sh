@@ -113,11 +113,12 @@ _size() {
     IW=$((WW - 4)) # width of the contents of the window
 }
 
-# Keys are read one at a time, without echo; the previous mode is put back
-# when the dialog closes (dialogs run in sub-shells: nothing else survives).
+# Keys are read one at a time, without echo, and those typed before the
+# dialog opened are discarded. The echo stays off after it closes (dialogs
+# run in sub-shells: nothing else survives); screen turns it on again.
 _begin() {
-    _STTY=$(stty -g </dev/tty 2>/dev/null)
-    stty -echo -icanon </dev/tty 2>/dev/null
+    kbd_hush
+    kbd_drain
     TUI_RESIZED=0
     trap 'TUI_RESIZED=1' WINCH
     [[ ${UI_MOUSE:-1} == 1 ]] && printf '\e[?1000h\e[?1006h' >/dev/tty
@@ -125,7 +126,7 @@ _begin() {
 }
 _end() {
     printf '\e[?1000l\e[?1006l' >/dev/tty
-    [[ -n $_STTY ]] && stty "$_STTY" </dev/tty 2>/dev/null
+    kbd_hush
 }
 
 # -> KEY: a name (UP, ENTER, ESC, CLICK, RESIZE…) or the character typed.
@@ -593,6 +594,7 @@ textbox() { # title, file
 # Notice displayed while the next dialog is being prepared
 busy() {
     local r
+    kbd_hush
     _size
     _chrome
     _wrap "$1" $((IW - 2))
@@ -606,6 +608,7 @@ busy() {
 # Steps that need the plain terminal (text to copy or to paste)
 screen() { # heading
     [[ -n $TUI_STTY ]] && stty "$TUI_STTY" </dev/tty 2>/dev/null
+    kbd_drain
     printf '\e[?1000l\e[?1006l\e[0m\e[?25h\e[H\e[J%s PROXDUMP %s %s %s\n\n' "${K[logo]}" "${K[header]}" "$1" "${K[norm]}"
 }
 

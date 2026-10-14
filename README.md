@@ -109,6 +109,7 @@ proxdump backup --all                     # every guest, every destination
 proxdump backup --to s3,onedrive 100 101  # given guests and destinations
 proxdump list                             # stored backups
 proxdump prune                            # apply retention
+proxdump update                           # install the latest release
 ```
 
 ## Documentation

@@ -112,6 +112,7 @@ proxdump backup --all                     # все гости, все назна
 proxdump backup --to s3,onedrive 100 101  # указанные гости и назначения
 proxdump list                             # сохранённые резервные копии
 proxdump prune                            # применить политику хранения
+proxdump update                           # установить последнюю версию
 ```
 
 ## Документация

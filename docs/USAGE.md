@@ -187,7 +187,10 @@ name before starting the copy if the original is still running.
 Menu **4 – Automatic scheduling** lists the schedules and lets you add or
 remove them. Selecting a schedule also offers **Run this schedule now**,
 which backs up its guests immediately, with the progress on screen, without
-changing the schedule. Several schedules can coexist, for instance a daily one for a
+changing the schedule, and **Change the guests included**, which keeps its
+time and destinations. A guest of the schedule that is no longer on the node
+is shown ticked, as "not found on this node", so that it can be removed.
+Several schedules can coexist, for instance a daily one for a
 critical guest and a weekly one for everything. Each schedule defines:
 
 - the destinations, among those that are configured (the question is
@@ -211,11 +214,20 @@ proxdump backup --to onedrive,gdrive 100   # several destinations
 proxdump list                              # stored backups
 proxdump prune                             # apply retention
 proxdump keepalive                         # renew the tokens that can lapse
+proxdump update                            # install the latest release
+proxdump update --check                    # only tell whether one exists
 ```
 
 Destinations are named `onedrive`, `gdrive`, `dropbox`, `s3` and `sftp`.
 Without `--to`, every
 configured destination is used; `list` and `prune` accept `--to` as well.
+
+`update` compares this version with the latest release published on GitHub
+and, if it is newer, installs it the way the tool was installed: the Debian
+package of the release, checked against the SHA-256 digest that GitHub
+publishes for it, or the archive of the release and its `install.sh`. It does
+not run while a backup or a restore is in progress, and leaves a copy run
+from a git clone to `git pull`. The configuration is not touched.
 
 `backup` returns the number of failures as its exit status (0 = everything
 succeeded). A lock prevents two operations from running at the same time:
