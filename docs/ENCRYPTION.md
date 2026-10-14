@@ -84,7 +84,7 @@ read the file can reveal it (`rclone reveal`). The protection is the
 permission of the file, and therefore root access to the node.
 
 **Configuration → Encryption → Display the passphrase** shows it again at
-any time. Keep a copy outside the server (password manager, printed copy):
+any time, on the plain terminal so that it can be selected and copied. Keep a copy outside the server (password manager, printed copy):
 without it the backups cannot be decrypted by anyone, including by this
 tool on a reinstalled server.
 

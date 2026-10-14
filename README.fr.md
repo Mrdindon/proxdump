@@ -27,14 +27,19 @@ terminal ; il n'y a rien à apprendre de `rclone`.
 - **Restauration** sous l'ID d'origine, sous un nouvel ID, ou simple
   téléchargement de l'archive déchiffrée. Les archives sont des archives
   `vzdump` standard : elles se restaurent aussi sans cet outil.
-- **Planification** : plusieurs planifications (quotidiennes ou
-  hebdomadaires, tous les invités ou une sélection, une ou plusieurs
-  destinations), chacune pouvant être exécutée sur-le-champ.
+- **Planification** : plusieurs planifications (quotidiennes,
+  hebdomadaires, mensuelles, annuelles ou manuelles ; tous les invités ou une
+  sélection ; une ou plusieurs destinations), chacune pouvant être exécutée
+  sur-le-champ, et dont les invités, la fréquence et l'heure se modifient
+  ensuite.
 - **Connexions guidées** : autorisation pas à pas pour OneDrive, Google
   Drive et Dropbox sur un serveur sans navigateur web ; formulaires simples
   pour S3 et SFTP.
 - **Deux interfaces** : une interface native avec thèmes de couleurs, souris
   et fenêtre de progression animée, ou les dialogues `whiptail` classiques.
+- **Mises à jour** : les menus indiquent s'il s'agit de la dernière version
+  et proposent d'installer la nouvelle ; `proxdump update` fait de même en
+  ligne de commande.
 - **Six langues** : anglais, français, espagnol, allemand, chinois
   (simplifié) et russe, pour l'interface et le journal.
 - **Empreinte réduite** : un script bash, `rclone`, `jq` et ce qu'un nœud

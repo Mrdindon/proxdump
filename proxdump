@@ -10,7 +10,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.0.2"
+VERSION="1.0.3"
 TITLE="proxdump $VERSION"
 
 CONF_DIR="${PROXDUMP_CONF_DIR:-/etc/proxdump}"
@@ -149,11 +149,16 @@ die() {
     exit 1
 }
 
-cleanup() {
+cleanup_dirs() {
     local d
     for d in "${CLEANUP_DIRS[@]:-}"; do
         [[ -n $d && -d $d ]] && rm -rf -- "$d"
     done
+    return 0
+}
+
+cleanup() {
+    cleanup_dirs
     declare -F tui_leave >/dev/null && tui_leave
     kbd_restore
     return 0
@@ -1742,7 +1747,8 @@ ui_setup_crypt() {
             C "$(t "Change the passphrase")") || return
         case $choice in
         S)
-            msg "$(t "Encryption passphrase:\n\n{1}\n\nPlease keep it outside this server (password manager, printed copy). Without it, the backups cannot be recovered." "$(current_passphrase)")"
+            show_passphrase "$(t "Encryption passphrase")" "$(current_passphrase)" \
+                "$(t "Please keep it outside this server (password manager, printed copy). Without it, the backups cannot be recovered.")"
             return
             ;;
         C)
@@ -1766,7 +1772,23 @@ ui_setup_crypt() {
     esac
     write_crypt_remote "$p1" || { msg "$(t "The encryption settings could not be saved.")"; return; }
     save_config
-    msg "$(t "Encryption is configured.\n\nPassphrase:\n\n{1}\n\nPlease record it now, outside this server. Without it, no restore is possible should this server be lost." "$p1")"
+    show_passphrase "$(t "Encryption is configured")" "$p1" \
+        "$(t "Please record it now, outside this server. Without it, no restore is possible should this server be lost.")"
+}
+
+# The passphrase is shown on the plain terminal, where it can be selected
+# with the mouse and copied: the dialogs keep the mouse to themselves.
+show_passphrase() { # heading, passphrase, advice
+    local width
+    width=$(stty size </dev/tty 2>/dev/null | cut -d' ' -f2)
+    width=${width:-80}
+    ((width > 80)) && width=80
+    screen "$1"
+    printf '%s\n\n    %s\n\n' "$(t "Passphrase:")" "$2"
+    fold -s -w "$width" <<<"$3"
+    echo
+    read -rsp "$(t "Press Enter once it has been recorded.") " _
+    echo
 }
 
 ui_remote_dir() {
@@ -1943,8 +1965,11 @@ ui_config() {
 # --- Scheduling --------------------------------------------------------------
 
 # Each schedule is one line of $CRON_FILE:
-#   MIN HOUR * * DOW root <proxdump> backup --to DEST (--all | ID…) >/dev/null 2>&1
-# and so is each daily token refresh:
+#   MIN HOUR DOM MON DOW root <proxdump> backup --to DEST (--all | ID…) >/dev/null 2>&1
+# daily (DOM MON DOW = * * *), weekly (* * DOW), monthly (DOM * *) or yearly
+# (DOM MON *). A manual schedule, only run from the menu, is the same line
+# commented out with '#manual ' (cron ignores it; its time is remembered).
+# Each daily token refresh is a line as well:
 #   MIN HOUR * * * root <proxdump> keepalive --to DEST >/dev/null 2>&1
 SCHEDULES=()
 KEEPALIVES=()
@@ -1954,7 +1979,7 @@ load_schedules() {
     SCHEDULES=()
     KEEPALIVES=()
     [[ -f $CRON_FILE ]] || return 0
-    mapfile -t SCHEDULES < <(grep -E '^[0-9]+ [0-9]+ \* \* [0-9*] root [^ ]+ backup ' "$CRON_FILE")
+    mapfile -t SCHEDULES < <(grep -E '^(#manual )?[0-9]+ [0-9]+ [0-9*]+ [0-9*]+ [0-9*] root [^ ]+ backup ' "$CRON_FILE")
     mapfile -t KEEPALIVES < <(grep -E '^[0-9]+ [0-9]+ \* \* \* root [^ ]+ keepalive --to [a-z0-9]+ ' "$CRON_FILE")
 }
 
@@ -2009,10 +2034,21 @@ keepalive() {
     return "$rc"
 }
 
-# Splits a cron line into S_MIN, S_HOUR, S_DOW, S_DEST and S_TARGETS
-# (S_TARGETS is '--all' or a list of IDs)
+# Splits a cron line into S_FREQ (D, W, M, Y or N for manual), S_MIN,
+# S_HOUR, S_DOM, S_MON, S_DOW, S_CMD (what follows 'root'), S_DEST and
+# S_TARGETS ('--all' or a list of IDs)
 schedule_parse() {
-    read -r S_MIN S_HOUR _ _ S_DOW _ _ _ S_TARGETS <<<"$1"
+    local line=$1
+    S_FREQ=""
+    [[ $line == "#manual "* ]] && { S_FREQ=N; line=${line#\#manual }; }
+    read -r S_MIN S_HOUR S_DOM S_MON S_DOW _ S_CMD <<<"$line"
+    if [[ -z $S_FREQ ]]; then
+        if [[ $S_MON != "*" ]]; then S_FREQ=Y
+        elif [[ $S_DOM != "*" ]]; then S_FREQ=M
+        elif [[ $S_DOW != "*" ]]; then S_FREQ=W
+        else S_FREQ=D; fi
+    fi
+    read -r _ _ S_TARGETS <<<"$S_CMD"
     S_TARGETS=${S_TARGETS% >/dev/null 2>&1}
     S_DEST="" # no --to: every configured destination
     if [[ $S_TARGETS == "--to "* ]]; then
@@ -2022,16 +2058,29 @@ schedule_parse() {
     fi
 }
 
+# Builds the cron line of the S_* fields
+schedule_line() {
+    local line="$S_MIN $S_HOUR $S_DOM $S_MON $S_DOW root $S_CMD"
+    [[ $S_FREQ == N ]] && line="#manual $line"
+    printf '%s' "$line"
+}
+
 # i18n: "Sunday" "Monday" "Tuesday" "Wednesday" "Thursday" "Friday" "Saturday"
+DAYS=(Sunday Monday Tuesday Wednesday Thursday Friday Saturday)
+# i18n: "January" "February" "March" "April" "May" "June" "July" "August" "September" "October" "November" "December"
+MONTHS=("" January February March April May June July August September October November December)
+
 schedule_label() { # cron line -> readable label
-    local when what time days=(Sunday Monday Tuesday Wednesday Thursday Friday Saturday)
+    local when what time
     schedule_parse "$1"
     printf -v time '%02d:%02d' "$S_HOUR" "$S_MIN"
-    if [[ $S_DOW == "*" ]]; then
-        when=$(t "Daily at {1}" "$time")
-    else
-        when=$(t "Weekly on {1} at {2}" "$(t "${days[S_DOW]}")" "$time")
-    fi
+    case $S_FREQ in
+    D) when=$(t "Daily at {1}" "$time") ;;
+    W) when=$(t "Weekly on {1} at {2}" "$(t "${DAYS[S_DOW]}")" "$time") ;;
+    M) when=$(t "Monthly on day {1} at {2}" "$S_DOM" "$time") ;;
+    Y) when=$(t "Yearly on {1} {2} at {3}" "$(t "${MONTHS[S_MON]}")" "$S_DOM" "$time") ;;
+    N) when=$(t "Manual (run from this menu only)") ;;
+    esac
     if [[ $S_TARGETS == --all ]]; then what=$(t "all guests"); else what=$(t "guests {1}" "$S_TARGETS"); fi
     t "{1}, {2}, to {3}" "$when" "$what" "$(dest_label "$S_DEST")"
 }
@@ -2080,48 +2129,93 @@ schedule_guests() { # current targets
     echo "${sel% }"
 }
 
+# Asks when a schedule runs, and sets S_FREQ, S_MIN, S_HOUR, S_DOM, S_MON
+# and S_DOW; the current values (those of S_* when called) are the defaults.
+# A manual schedule keeps its previous time, for when it is enabled again.
+schedule_when() {
+    local freq time i items=() max day
+    freq=$(menu "$(t "Frequency of the backup")" \
+        D "$(t "Daily")" \
+        W "$(t "Weekly")" \
+        M "$(t "Monthly")" \
+        Y "$(t "Yearly")" \
+        N "$(t "Manual: run only from this menu")") || return 1
+    S_FREQ=$freq
+    [[ $freq == N ]] && return 0
+    S_DOM="*" S_MON="*"
+    [[ $freq == W ]] || S_DOW="*"
+    case $freq in
+    W)
+        S_DOW=$(menu "$(t "Select the day of the week:")" 1 "$(t "Monday")" 2 "$(t "Tuesday")" 3 "$(t "Wednesday")" 4 "$(t "Thursday")" 5 "$(t "Friday")" 6 "$(t "Saturday")" 0 "$(t "Sunday")") || return 1
+        ;;
+    Y)
+        for i in {1..12}; do items+=("$i" "$(t "${MONTHS[i]}")"); done
+        S_MON=$(menu "$(t "Select the month:")" "${items[@]}") || return 1
+        ;;
+    esac
+    if [[ $freq == M || $freq == Y ]]; then
+        # days that some months lack would skip those months
+        max=28
+        [[ $freq == Y ]] && case $S_MON in 2) max=28 ;; 4 | 6 | 9 | 11) max=30 ;; *) max=31 ;; esac
+        day=$(input "$(t "Day of the month (1 to {1}):" "$max")" "${CUR_DOM:-1}") || return 1
+        day=$(trim "$day")
+        [[ $day =~ ^[0-9]+$ ]] && ((10#$day >= 1 && 10#$day <= max)) || { msg "$(t "The day entered is not valid.")"; return 1; }
+        S_DOM=$((10#$day))
+    fi
+    printf -v time '%02d:%02d' "${S_HOUR:-2}" "${S_MIN:-0}"
+    time=$(input "$(t "Start time (HH:MM, 24-hour clock):")" "$time") || return 1
+    [[ $time =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]] || { msg "$(t "The time entered is not valid.")"; return 1; }
+    S_HOUR=$((10#${BASH_REMATCH[1]}))
+    S_MIN=$((10#${BASH_REMATCH[2]}))
+}
+
+# Saves the schedule built from S_* at index $1 (empty: a new one)
+schedule_store() { # index
+    local new i
+    new=$(schedule_line)
+    load_schedules
+    for i in "${!SCHEDULES[@]}"; do
+        [[ $i != "${1:-}" && ${SCHEDULES[$i]#\#manual } == "${new#\#manual }" ]] &&
+            { msg "$(t "An identical schedule already exists.")"; return 1; }
+    done
+    if [[ -n ${1:-} ]]; then SCHEDULES[$1]=$new; else SCHEDULES+=("$new"); fi
+    save_schedules
+    if [[ $S_FREQ == N ]]; then
+        msg "$(t "The schedule has been saved:\n\n{1}\n\nIt does not run by itself: start it with 'Run this schedule now'." "$(schedule_label "$new")")"
+    else
+        msg "$(t "The schedule has been saved:\n\n{1}\n\nProgress is recorded in {2}." "$(schedule_label "$new")" "$LOG_FILE")"
+    fi
+}
+
 # Replaces the guests of a schedule; when, where and how stay the same
 ui_schedule_guests() { # index in SCHEDULES
-    local line=${SCHEDULES[$1]} targets new i
-    schedule_parse "$line"
+    local targets
+    schedule_parse "${SCHEDULES[$1]}"
     targets=$(schedule_guests "$S_TARGETS") || return
     [[ $targets == "$S_TARGETS" ]] && return
-    new="${line%% backup *} backup ${S_DEST:+--to $S_DEST }$targets >/dev/null 2>&1"
-    for i in "${!SCHEDULES[@]}"; do
-        [[ ${SCHEDULES[$i]} == "$new" ]] && { msg "$(t "An identical schedule already exists.")"; return; }
-    done
-    SCHEDULES[$1]=$new
-    save_schedules
-    msg "$(t "The schedule has been saved:\n\n{1}\n\nProgress is recorded in {2}." "$(schedule_label "$new")" "$LOG_FILE")"
+    S_CMD="${S_CMD%% backup *} backup ${S_DEST:+--to $S_DEST }$targets >/dev/null 2>&1"
+    schedule_store "$1"
+}
+
+# Changes when a schedule runs; its guests and destinations stay the same
+ui_schedule_when() { # index in SCHEDULES
+    local old=${SCHEDULES[$1]}
+    schedule_parse "$old"
+    CUR_DOM=${S_DOM/\*/1}
+    schedule_when || return
+    [[ $(schedule_line) == "$old" ]] && return
+    schedule_store "$1"
 }
 
 ui_schedule_add() {
-    local id dest choice dow="*" time hour min targets self line
+    local dest targets
     pick_dests || return
     dest=$(IFS=,; echo "${DESTS[*]}")
-
-    choice=$(menu "$(t "Frequency of the backup")" \
-        D "$(t "Daily")" \
-        W "$(t "Weekly")") || return
-    if [[ $choice == W ]]; then
-        dow=$(menu "$(t "Select the day of the week:")" 1 "$(t "Monday")" 2 "$(t "Tuesday")" 3 "$(t "Wednesday")" 4 "$(t "Thursday")" 5 "$(t "Friday")" 6 "$(t "Saturday")" 0 "$(t "Sunday")") || return
-    fi
-    time=$(input "$(t "Start time (HH:MM, 24-hour clock):")" "02:00") || return
-    [[ $time =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]] || { msg "$(t "The time entered is not valid.")"; return; }
-    hour=$((10#${BASH_REMATCH[1]}))
-    min=$((10#${BASH_REMATCH[2]}))
-
+    S_MIN=0 S_HOUR=2 S_DOM="*" S_MON="*" S_DOW="*" CUR_DOM=1
+    schedule_when || return
     targets=$(schedule_guests) || return
-
-    self=$(self_path)
-    line="$min $hour * * $dow root $self backup --to $dest $targets >/dev/null 2>&1"
-    load_schedules
-    for id in "${SCHEDULES[@]}"; do
-        [[ $id == "$line" ]] && { msg "$(t "An identical schedule already exists.")"; return; }
-    done
-    SCHEDULES+=("$line")
-    save_schedules
-    msg "$(t "The schedule has been saved:\n\n{1}\n\nProgress is recorded in {2}." "$(schedule_label "$line")" "$LOG_FILE")"
+    S_CMD="$(self_path) backup --to $dest $targets >/dev/null 2>&1"
+    schedule_store ""
 }
 
 ui_schedule() {
@@ -2132,7 +2226,7 @@ ui_schedule() {
         for i in "${!SCHEDULES[@]}"; do
             items+=("$((i + 1))" "$(schedule_label "${SCHEDULES[$i]}")")
         done
-        choice=$(CANCEL=Back menu "$(t "Automatic backups (cron): {1} schedule(s) defined.\n\nSelect a schedule to run it now, to change its guests or to remove it, or add a new one. Schedules that overlap are run one after the other." "${#SCHEDULES[@]}")" "${items[@]}") || return
+        choice=$(CANCEL=Back menu "$(t "Automatic backups (cron): {1} schedule(s) defined.\n\nSelect a schedule to run it now, to change it or to remove it, or add a new one. Schedules that overlap are run one after the other." "${#SCHEDULES[@]}")" "${items[@]}") || return
         if [[ $choice == A ]]; then
             ui_schedule_add
             continue
@@ -2141,10 +2235,12 @@ ui_schedule() {
         label=$(schedule_label "${SCHEDULES[$i]}")
         choice=$(CANCEL=Back menu "$label" \
             R "$(t "Run this schedule now")" \
+            W "$(t "Change the frequency and time")" \
             G "$(t "Change the guests included")" \
             D "$(t "Remove this schedule")") || continue
         case $choice in
         R) ui_schedule_run "${SCHEDULES[$i]}" ;;
+        W) ui_schedule_when "$i" ;;
         G) ui_schedule_guests "$i" ;;
         D)
             confirm_no "$(t "Remove the following schedule?\n\n{1}" "$label")" || continue
@@ -2166,7 +2262,7 @@ ui_log() {
 }
 
 main_menu() {
-    local choice
+    local choice update_item
     local id
     ensure_crypt
     if [[ -z $(dest_list) ]]; then
@@ -2177,13 +2273,16 @@ main_menu() {
         names_plain || ui_migrate_names
     done
     while :; do
+        update_item=()
+        [[ ${UPDATE_STATE:-} == new ]] && update_item=(U "$(t "Update proxdump to version {1}" "$LATEST")")
         choice=$(CANCEL=Quit menu "$(t "Encrypted backup of Proxmox VE to cloud storage (node: {1})" "$(hostname -s)")" \
             1 "$(t "Back up virtual machines and containers")" \
             2 "$(t "Restore a backup")" \
             3 "$(t "Manage the stored backups")" \
             4 "$(t "Automatic scheduling")" \
             5 "$(t "Configuration")" \
-            6 "$(t "Log")") || break
+            6 "$(t "Log")" \
+            "${update_item[@]}") || break
         case $choice in
         1) ui_backup ;;
         2) ui_restore ;;
@@ -2191,6 +2290,7 @@ main_menu() {
         4) ui_schedule ;;
         5) ui_config ;;
         6) ui_log ;;
+        U) ui_update ;;
         esac
     done
     if declare -F tui_leave >/dev/null; then tui_leave; else clear; fi
@@ -2200,6 +2300,33 @@ main_menu() {
 
 PROJECT_REPO="Mrdindon/proxdump"
 
+# Asks GitHub for the latest release: sets REL (its description), TAG and
+# LATEST (its version); fails if GitHub does not answer within the delay.
+latest_release() { # [seconds]
+    REL=$(curl -fsSL --connect-timeout "${1:-30}" --max-time "${1:-30}" \
+        "https://api.github.com/repos/$PROJECT_REPO/releases/latest" 2>/dev/null) || return 1
+    TAG=$(jq -r '.tag_name // ""' <<<"$REL" 2>/dev/null)
+    LATEST=${TAG#v}
+    [[ $LATEST =~ ^[0-9][0-9.]*$ ]]
+}
+
+# For the menus: UPDATE_STATE is 'current', 'new' (LATEST is newer) or
+# 'unknown' (GitHub could not be reached), and VERSION_NOTE says so in the
+# title bar. A short delay: the menus should not wait for long.
+check_latest() {
+    if ! latest_release 5; then
+        UPDATE_STATE=unknown
+        VERSION_NOTE=$(t "latest version: unknown")
+    elif dpkg --compare-versions "$LATEST" le "$VERSION"; then
+        UPDATE_STATE=current
+        VERSION_NOTE=$(t "latest version: yes")
+    else
+        UPDATE_STATE=new
+        VERSION_NOTE=$(t "latest version: please update ({1})" "$LATEST")
+    fi
+    TITLE="proxdump $VERSION — $VERSION_NOTE"
+}
+
 # Installs the latest release published on GitHub if it is newer than this
 # one, the way this copy was installed: the Debian package (checked against
 # the digest GitHub publishes), or the archive of the release and its
@@ -2208,11 +2335,8 @@ update() { # [--check]
     local self dir rel tag latest pkg asset url digest tmp
     self=$(readlink -f "${BASH_SOURCE[0]}")
     dir=$(dirname "$self")
-    rel=$(curl -fsSL --max-time 30 "https://api.github.com/repos/$PROJECT_REPO/releases/latest") ||
-        die "$(t "the latest version could not be obtained from GitHub.")"
-    tag=$(jq -r '.tag_name // ""' <<<"$rel")
-    latest=${tag#v}
-    [[ $latest =~ ^[0-9][0-9.]*$ ]] || die "$(t "the latest version could not be obtained from GitHub.")"
+    latest_release 30 || die "$(t "the latest version could not be obtained from GitHub.")"
+    rel=$REL tag=$TAG latest=$LATEST
     if dpkg --compare-versions "$latest" le "$VERSION"; then
         t "proxdump {1} is up to date." "$VERSION"
         return 0
@@ -2251,6 +2375,26 @@ update() { # [--check]
     fi
     release_lock
     log "$(t "proxdump updated from {1} to {2}." "$VERSION" "$latest")"
+}
+
+# Update from the menus: on the plain terminal, which shows what the
+# installation prints; the new version then replaces this one.
+ui_update() {
+    confirm "$(t "proxdump {1} is available (installed: {2}).\n\nInstall it now? The menus are reopened afterwards." "$LATEST" "$VERSION")" || return
+    screen "$(t "Update to version {1}" "$LATEST")"
+    # update exits on error: it runs in a sub-shell, which removes its files
+    if (trap cleanup_dirs EXIT; update); then
+        echo
+        read -rsp "$(t "Press Enter to open the new version.") " _
+        # exec skips the EXIT trap
+        cleanup_dirs
+        declare -F tui_leave >/dev/null && tui_leave
+        kbd_restore
+        exec "$(self_path)"
+    fi
+    echo
+    read -rsp "$(t "Press Enter to return to the menu.") " _
+    echo
 }
 
 # --- Command line ------------------------------------------------------------
@@ -2304,6 +2448,8 @@ main() {
     case $cmd in
     "")
         [[ -t 0 && -t 1 ]] || die "$(t "the menus need a terminal; see --help.")"
+        # before the menus: a slow answer then leaves the terminal as it is
+        check_latest
         TTY_STTY=$(stty -g </dev/tty 2>/dev/null)
         # dialogs drawn by the tool itself instead of whiptail
         if [[ ${PROXDUMP_UI:-$UI_STYLE} == native && -r $LIB_DIR/tui.sh ]]; then

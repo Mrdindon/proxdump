@@ -27,14 +27,18 @@ terminal; no hace falta aprender nada de `rclone`.
 - **Restauración** con el ID original, con un ID nuevo, o simple descarga
   del archivo descifrado. Los archivos son archivos `vzdump` estándar:
   también pueden restaurarse sin esta herramienta.
-- **Programación**: varias programaciones (diarias o semanales, todos los
-  huéspedes o una selección, uno o varios destinos), que también pueden
-  ejecutarse al momento.
+- **Programación**: varias programaciones (diarias, semanales, mensuales,
+  anuales o manuales; todos los huéspedes o una selección; uno o varios
+  destinos), que también pueden ejecutarse al momento y cuyos huéspedes,
+  frecuencia y hora pueden cambiarse después.
 - **Conexiones guiadas**: autorización paso a paso para OneDrive, Google
   Drive y Dropbox en un servidor sin navegador web; formularios sencillos
   para S3 y SFTP.
 - **Dos interfaces**: una nativa con temas de colores, ratón y ventana de
   progreso animada, o los diálogos clásicos de `whiptail`.
+- **Actualizaciones**: los menús indican si es la última versión y ofrecen
+  instalar la nueva; `proxdump update` hace lo mismo desde la línea de
+  comandos.
 - **Seis idiomas**: inglés, francés, español, alemán, chino (simplificado)
   y ruso, para la interfaz y el registro.
 - **Ligero**: un script de bash, `rclone`, `jq` y lo que un nodo Proxmox VE

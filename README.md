@@ -27,13 +27,17 @@ terminal; nothing has to be learnt about `rclone`.
 - **Restore** under the original ID, under a new ID, or simple download of
   the decrypted archive. The archives are standard `vzdump` archives: they
   can also be restored without this tool.
-- **Scheduling**: several schedules (daily or weekly, all guests or a
-  selection, one or several destinations), each of which can be run at once.
+- **Scheduling**: several schedules (daily, weekly, monthly, yearly or
+  manual; all guests or a selection; one or several destinations), each of
+  which can be run at once, and whose guests, frequency and time can be
+  changed later.
 - **Guided connections**: step-by-step authorization for OneDrive, Google
   Drive and Dropbox on a server without a web browser; simple forms for S3
   and SFTP.
 - **Two interfaces**: a native one with colour themes, mouse and an animated
   progress window, or the classic `whiptail` dialogs.
+- **Updates**: the menus say whether this is the latest version and offer
+  to install the new one; `proxdump update` does the same from the shell.
 - **Six languages**: English, French, Spanish, German, Chinese (simplified)
   and Russian, for the interface and the log.
 - **Small footprint**: a bash script, `rclone`, `jq` and what a Proxmox VE

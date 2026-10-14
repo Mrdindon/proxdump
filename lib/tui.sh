@@ -274,14 +274,19 @@ _at() { FRAME+=$'\e['"$1;$2"'H'"$3"; }
 # Starts a frame: header bar, cleared screen, footer with the key hints
 # ("key:label" pairs)
 _chrome() {
-    local hint left right pad
+    local hint left right pad note
     FRAME=$'\e[?25l\e[H\e[J'
-    left=" PROXDUMP ${VERSION} "
+    # whether this is the latest version, if it fits
+    note=${VERSION_NOTE:+"· $VERSION_NOTE "}
     right=" $(hostname -s) "
-    _dw "$left$right"
+    _dw " PROXDUMP ${VERSION} $note$right"
+    if ((REPLY > COLS)); then
+        note=""
+        _dw " PROXDUMP ${VERSION} $right"
+    fi
     pad=$((COLS - REPLY)); ((pad < 0)) && pad=0
     printf -v pad '%*s' "$pad" ''
-    _at 1 1 "${K[logo]} PROXDUMP ${K[header_dim]}${VERSION} ${K[header]}${pad}${K[header_dim]}${right}${K[norm]}"
+    _at 1 1 "${K[logo]} PROXDUMP ${K[header_dim]}${VERSION} ${note}${K[header]}${pad}${K[header_dim]}${right}${K[norm]}"
     left=""
     for hint; do
         left+="${hint%%:*} ${hint#*:}  "

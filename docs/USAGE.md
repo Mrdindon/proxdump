@@ -89,6 +89,8 @@ A single passphrase protects every destination.
 > are permanently unreadable — nobody, not even the storage provider, can decrypt them.
 
 The same menu lets you display the passphrase again later, or change it.
+The passphrase is shown on the plain terminal, outside the dialogs, so that
+it can be selected with the mouse and copied.
 Note: existing backups remain encrypted with the old passphrase.
 
 The algorithms, what stays visible on the destination and where the secrets
@@ -185,22 +187,31 @@ name before starting the copy if the original is still running.
 ## Scheduling and command line
 
 Menu **4 – Automatic scheduling** lists the schedules and lets you add or
-remove them. Selecting a schedule also offers **Run this schedule now**,
-which backs up its guests immediately, with the progress on screen, without
-changing the schedule, and **Change the guests included**, which keeps its
-time and destinations. A guest of the schedule that is no longer on the node
-is shown ticked, as "not found on this node", so that it can be removed.
-Several schedules can coexist, for instance a daily one for a
-critical guest and a weekly one for everything. Each schedule defines:
+remove them. Selecting a schedule also offers:
+
+- **Run this schedule now**, which backs up its guests immediately, with the
+  progress on screen, without changing the schedule;
+- **Change the frequency and time**, which keeps its guests and
+  destinations; the current time is offered as the default;
+- **Change the guests included**, which keeps its frequency, time and
+  destinations. A guest of the schedule that is no longer on the node is
+  shown ticked, as "not found on this node", so that it can be removed.
+
+Several schedules can coexist, for instance a daily one for a critical
+guest and a weekly one for everything. Each schedule defines:
 
 - the destinations, among those that are configured (the question is
   skipped when there is only one);
-- the frequency: daily, or weekly on a given day;
-- the start time (HH:MM);
+- the frequency: daily, weekly on a given day, monthly on a given day (1 to
+  28, so that no month is skipped), yearly on a given date, or **manual**:
+  a manual schedule never runs by itself and is started with **Run this
+  schedule now**; it keeps its last time, should it become automatic again;
+- the start time (HH:MM), except for a manual schedule;
 - the guests: either **all guests on the node**, which includes those added
   later, or **a selection** of guests.
 
-The schedules are stored in `/etc/cron.d/proxdump`, one line each. A
+The schedules are stored in `/etc/cron.d/proxdump`, one line each; a
+manual schedule is its line commented out with `#manual`. A
 schedule that starts while another backup is still running waits for its
 turn (up to 12 hours).
 
@@ -228,6 +239,13 @@ package of the release, checked against the SHA-256 digest that GitHub
 publishes for it, or the archive of the release and its `install.sh`. It does
 not run while a backup or a restore is in progress, and leaves a copy run
 from a git clone to `git pull`. The configuration is not touched.
+
+The menus check the latest release when they open (for at most 5 seconds)
+and say in the title bar whether this is the latest version: *yes*,
+*please update (x.y.z)*, or *unknown* when GitHub could not be reached.
+When a newer release exists, the main menu offers **U – Update proxdump**,
+which does the same as `proxdump update`, shows what it prints, then
+reopens the menus with the new version.
 
 `backup` returns the number of failures as its exit status (0 = everything
 succeeded). A lock prevents two operations from running at the same time:

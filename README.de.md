@@ -29,14 +29,18 @@ kennen.
   oder einfacher Download des entschlüsselten Archivs. Die Archive sind
   gewöhnliche `vzdump`-Archive: Sie lassen sich auch ohne dieses Werkzeug
   wiederherstellen.
-- **Zeitplanung**: mehrere Zeitpläne (täglich oder wöchentlich, alle Gäste
-  oder eine Auswahl, ein oder mehrere Ziele), die sich auch sofort ausführen
-  lassen.
+- **Zeitplanung**: mehrere Zeitpläne (täglich, wöchentlich, monatlich,
+  jährlich oder manuell; alle Gäste oder eine Auswahl; ein oder mehrere
+  Ziele), die sich auch sofort ausführen lassen und deren Gäste, Häufigkeit
+  und Uhrzeit sich später ändern lassen.
 - **Geführte Verbindungen**: schrittweise Autorisierung für OneDrive, Google
   Drive und Dropbox auf einem Server ohne Webbrowser; einfache Formulare für
   S3 und SFTP.
 - **Zwei Oberflächen**: eine native mit Farbschemata, Maus und animiertem
   Fortschrittsfenster, oder die klassischen `whiptail`-Dialoge.
+- **Aktualisierungen**: Die Menüs zeigen, ob dies die neueste Version ist,
+  und bieten an, die neue zu installieren; `proxdump update` tut dasselbe
+  auf der Kommandozeile.
 - **Sechs Sprachen**: Englisch, Französisch, Spanisch, Deutsch, Chinesisch
   (vereinfacht) und Russisch, für Oberfläche und Protokoll.
 - **Schlank**: ein Bash-Skript, `rclone`, `jq` und das, was ein
